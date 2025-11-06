@@ -1,0 +1,16 @@
+# 강화된 도메인 변형 (Fog / Light / Distortion 등)
+hsv_h: 0.1
+hsv_s: 0.9
+hsv_v: 0.9
+translate: 0.2
+scale: 0.6
+shear: 0.0
+perspective: 0.0005
+flipud: 0.0
+fliplr: 0.5
+
+# 노이즈/블러 등은 Albumentations 파이프라인 내부에서 처리
+# ultralytics 11 기준, 이건 hyp.yaml에 아래처럼 등록 가능
+augmentations:
+  - blur: 0.3
+  - gaussian_noise: 0.3

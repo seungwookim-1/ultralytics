@@ -46,6 +46,11 @@ RUN pip install uv && \
     # Remove extra build files \
     rm -rf tmp /root/.config/Ultralytics/persistent_cache.json
 
+
+# Commands
+# sudo docker run -it --ipc=host -v "$(pwd)":/ultralytics --gpus all ultralytics/ultralytics:latest 
+
+    
 # Usage Examples -------------------------------------------------------------------------------------------------------
 
 # Build and Push

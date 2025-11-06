@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -482,6 +483,43 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+    
+    def _ensure_detect_hook(self):
+        """Register a forward_pre_hook on the Detect head to capture its input feature maps (P3/P4/P5)."""
+        if not hasattr(self, "_detect_hook") or self._detect_hook is None:
+            # de_parallel: DDP 래핑 제거 후 실제 모듈 얻기
+            detect = self.model[-1]
+            assert isinstance(detect, Detect), "Last module must be Detect (or subclass)."
+            self._pyramid = None  # will be filled at forward
+            def _pre_hook(module, inputs):
+                # inputs: tuple([p3, p4, p5]) 형태
+                feats = inputs[0] if isinstance(inputs, (list, tuple)) else inputs
+                # 보통 순서는 [P3(8x), P4(16x), P5(32x)] 이지만, 안전하게 len 체크
+                if isinstance(feats, (list, tuple)) and len(feats) >= 3:
+                    self._pyramid = {
+                        "P3": feats[0],
+                        "P4": feats[1],
+                        "P5": feats[2],
+                    }
+                else:
+                    # 단일 피처만 들어오는 변형 대응
+                    self._pyramid = {"P3": feats}
+            self._detect_hook = detect.register_forward_pre_hook(_pre_hook)
+
+    @torch.no_grad()  # teacher 측에서 자주 쓸 수 있으니 기본 no_grad 권장(필요 시 해제)
+    def forward_features(self, x: torch.Tensor, normalize: bool = True) -> dict[str, torch.Tensor]:
+        """
+        Returns neck outputs just before Detect: {'P3': ..., 'P4': ..., 'P5': ...}.
+        """
+        self._ensure_detect_hook()
+        _ = self.forward(x)  # 일반 forward를 호출하면 훅이 입력 피처를 채움
+        feats = self._pyramid
+        if feats is None:
+            raise RuntimeError("Detect hook didn't capture features. Check Detect location or forward path.")
+        if normalize:
+            # 채널 방향 정규화(증류 안정화에 도움)
+            feats = {k: F.normalize(v, dim=1) for k, v in feats.items() if v is not None}
+        return feats
 
 
 class OBBModel(DetectionModel):
