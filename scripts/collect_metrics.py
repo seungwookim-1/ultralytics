@@ -3,9 +3,9 @@ from ultralytics import YOLO
 import pathlib, csv
 
 EVALS = [
-    ("A_teacher",      "runs/A_teacher/weights/best.pt",      "runs/Eval_A_teacher"),
-    ("B_no_distill",   "runs/B_no_distill/weights/best.pt",   "runs/Eval_A_after_B_no_distill"),
-    ("B_with_distill", "runs/B_with_distill/weights/best.pt", "runs/Eval_A_after_B_with_distill"),
+    ("A_teacher", "runs/A_teacher/weights/best.pt", "runs/Eval_A_teacher"),
+    ("B_no_distill_debug12", "runs/B_no_distill_debug12/weights/best.pt", "runs/Eval_B_no_distill_debug12"),
+    ("B_with_kd005", "runs/B_with_kd005/weights/best.pt", "runs/Eval_B_with_kd005"),
 ]
 
 def read_results_csv(folder):

@@ -522,6 +522,213 @@ class DetectionModel(BaseModel):
         return feats
 
 
+# 추가 코드
+class SceneHead(nn.Module):
+    def __init__(self, in_ch, nc):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(in_ch, nc)
+    def forward(self, feats, targets=None):
+        # feats: parse_model 후 Detect 직전의 피처 피라미드 중 최상단(예: P5) 사용
+        P5 = feats[-1] if isinstance(feats, (list, tuple)) else feats
+        z = self.pool(P5).flatten(1)
+        logits = self.fc(z)
+        if self.training:
+            if logits.ndim == 1: logits = logits.unsqueeze(0)
+            loss = nn.CrossEntropyLoss()(logits, targets)  # 다중라벨이면 BCEWithLogitsLoss
+            return {"loss": loss, "logits": logits}
+        return {"logits": logits}
+
+
+class MultiHeadTail(nn.Module):
+    """
+    Multi-head detection module that replaces the final Detect layer.
+    Creates separate detection heads for different task types.
+    """
+    def __init__(self, base_detect: Detect, head_defs: dict, lambdas: dict = None):
+        super().__init__()
+        self.head_defs = head_defs
+        self.lambdas = lambdas or {k: 1.0 for k in head_defs.keys()}
+        self.detect_heads = nn.ModuleDict()
+        
+        # Copy attributes from base_detect that are needed for YOLO forward loop
+        self.f = base_detect.f  # from which layers
+        self.i = base_detect.i  # index in model
+        self.type = "MultiHeadTail"  # module type
+        
+        # Store base detect properties
+        self.nl = base_detect.nl  # number of detection layers
+        self.reg_max = base_detect.reg_max
+        self.stride = base_detect.stride
+        self.nc_base = base_detect.nc
+        
+        # Get input channel info for each detection layer
+        # These are the channels coming from the neck (P3, P4, P5)
+        input_channels = [base_detect.cv2[i][0].conv.in_channels for i in range(base_detect.nl)]
+        
+        # Create separate Detect head for each task
+        for head_name, head_cfg in head_defs.items():
+            nc = head_cfg.get("nc", 80)
+            
+            # Deep copy the entire head first
+            head = deepcopy(base_detect)
+            head.nc = nc
+            
+            # Now rebuild cv3 to output nc classes instead of base_detect.nc
+            # The cv3 structure is: Sequential(DWConv, Conv, final_conv)
+            # We need to replace only the final conv layer
+            
+            new_cv3 = nn.ModuleList()
+            for i in range(head.nl):
+                # Get the existing cv3 sequential from the COPIED head
+                old_cv3 = head.cv3[i]
+                
+                # Get dimensions from the second-to-last layer's output
+                c_hidden = old_cv3[-1].in_channels
+                
+                # Build new cv3: keep first two layers from copied head, replace final layer
+                new_seq = nn.Sequential(
+                    old_cv3[0],  # DWConv from copied head
+                    old_cv3[1],  # Conv from copied head
+                    nn.Conv2d(c_hidden, nc, 1, bias=False)  # New classification layer
+                )
+                new_cv3.append(new_seq)
+            
+            head.cv3 = new_cv3
+            
+            # Update no (number of outputs per anchor)
+            head.no = head.cv2[0][-1].out_channels + nc
+            
+            self.detect_heads[head_name] = head
+        
+        # Use first head's properties
+        first_head = next(iter(self.detect_heads.values()))
+        self.no = 4 + self.nc_base  # Keep base nc for module compatibility
+        
+    def forward(self, x):
+        """
+        Forward pass through all heads.
+        
+        Args:
+            x: List of feature maps from neck [P3, P4, P5]
+            
+        Returns:
+            Dict of outputs from each head
+        """
+        outputs = {}
+        for head_name, head in self.detect_heads.items():
+            outputs[head_name] = head(x)
+        return outputs
+
+
+
+class MultiHeadDetectionModel(DetectionModel):
+    """
+    YOLOv11 model with multiple detection heads sharing a single backbone.
+    """
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True,
+                 head_defs: dict = None, lambdas: dict = None):
+        """
+        Args:
+            cfg: Model configuration file
+            ch: Number of input channels
+            nc: Number of classes (ignored when using head_defs)
+            verbose: Print model details
+            head_defs: Dict defining each head, e.g.:
+                {"vehicle": {"type": "detect", "nc": 8},
+                 "vru": {"type": "detect", "nc": 2},
+                 "scene": {"type": "classify", "nc": 5}}
+            lambdas: Loss weights for each head, e.g.:
+                {"vehicle": 1.0, "vru": 1.0, "scene": 10.0}
+        """
+        # Initialize base model first with default nc
+        super().__init__(cfg, ch, nc or 80, verbose)
+        
+        self.head_defs = head_defs
+        self.lambdas = lambdas or {}
+        
+        if head_defs:
+            # Replace final Detect layer with MultiHeadTail
+            last = self.model[-1]
+            assert isinstance(last, Detect), "Last module must be Detect for multi-head"
+            
+            # Create multi-head module
+            mh = MultiHeadTail(last, head_defs, lambdas)
+            self.model[-1] = mh
+            
+            # Update stride (already computed by parent __init__)
+            self.model[-1].stride = self.stride
+            for head in self.model[-1].detect_heads.values():
+                head.stride = self.stride
+    
+    def forward(self, x, targets: dict = None):
+        """
+        Forward pass.
+        
+        Args:
+            x: Input tensor [B, C, H, W]
+            targets: Dict of targets for each head (training only)
+                {"vehicle": [...], "vru": [...], ...}
+        
+        Returns:
+            Training: {"total_loss": loss, "per_head": {head: loss, ...}}
+            Inference: {head_name: predictions, ...}
+        """
+        # Forward through backbone and neck (same as parent class)
+        y = []
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+        
+        # x is now the multi-head outputs dict
+        if self.training and targets is not None:
+            return self._forward_train(x, targets)
+        else:
+            return x  # Dict of head outputs
+    
+    def _forward_train(self, outputs, targets):
+        """Training forward pass with loss computation."""
+        head_losses = {}
+        total_loss = 0.0
+        
+        for head_name, head in self.model[-1].detect_heads.items():
+            if head_name in targets:
+                pred = outputs[head_name]
+                
+                # Compute loss using head's built-in loss
+                if hasattr(head, 'loss'):
+                    loss = head.loss(pred, targets[head_name])
+                else:
+                    # Need to implement loss calculation
+                    loss = self._compute_detection_loss(pred, targets[head_name], head)
+                
+                # Apply lambda weighting
+                weighted_loss = loss * self.lambdas.get(head_name, 1.0)
+                head_losses[head_name] = weighted_loss
+                total_loss += weighted_loss
+        
+        return {
+            "total_loss": total_loss,
+            "per_head": head_losses
+        }
+    
+    def _compute_detection_loss(self, pred, targets, head):
+        """
+        Fallback loss computation if head doesn't have built-in loss.
+        """
+        # This requires integration with ultralytics loss functions
+        # For now, return dummy loss
+        return torch.tensor(0.0, device=pred[0].device if isinstance(pred, (list, tuple)) else pred.device, 
+                          requires_grad=True)
+    
+    def init_criterion(self):
+        """Initialize loss criteria for each head if needed."""
+        pass
+
+
+
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
 
@@ -1804,3 +2011,4 @@ def guess_model_task(model):
         "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
     )
     return "detect"  # assume detect
+
