@@ -1,6 +1,9 @@
 # Ultralytics YOLO 🚀 with SD_db_Library Integration, AGPL-3.0 license
 # Enhanced Dockerfile for YOLOv11 with Seoul Dynamics database integration
 # Image is CUDA-optimized for YOLO11 single/multi-GPU training and inference with database logging
+#❗SD_db_Library is a submodule for SeoulDynamics database. Clone the repository with --recurse-submodules option.
+# If you already cloned without submodule option, or if you need to update the library, use the following command:
+# git submodule update --init --recursive
 
 # Start FROM PyTorch image https://hub.docker.com/r/pytorch/pytorch or nvcr.io/nvidia/pytorch:23.03-py3
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
@@ -64,31 +67,8 @@ RUN yolo export model=tmp/yolo11n.pt format=ncnn imgsz=32
 # Requires <= Python 3.10, bug with paddlepaddle==2.5.0 https://github.com/PaddlePaddle/X2Paddle/issues/991
 RUN uv pip install --system "paddlepaddle>=2.6.0" x2paddle
 
-# Install SD_db_Library directly into the image (after main ultralytics installation)
-# Option 1: Copy from local directory during build (for development)
-# First copy SD_db_Library to the build context: cp -r /home/gihyukcho/library/SD_db_Library ./SD_db_Library
-# Then build with: docker build -f docker/Dockerfile-sd-db -t ultralytics/ultralytics:sd-db .
-COPY SD_db_Library /tmp/SD_db_Library
-RUN uv pip install --system -e /tmp/SD_db_Library
-
-# Option 2: Clone from git repository (when available)
-# RUN git clone https://github.com/SeoulDynamicsInc/SD_db_Library.git /tmp/SD_db_Library && \
-#     uv pip install --system -e /tmp/SD_db_Library && \
-#     rm -rf /tmp/SD_db_Library/.git
-
-# Option 3: Install from PyPI (if published)
-# RUN uv pip install --system SD_db_Library
-
 # Create directories for SD_db_Library
 RUN mkdir -p /ultralytics/data /ultralytics/logs /ultralytics/models
-
-# Copy environment template for SD_db_Library
-# COPY .env.example /ultralytics/.env.example
-
-# Create the .env file for SD_db_Library in the expected location
-# RUN mkdir -p /tmp/SD_db_Library/SD_db_Library/.. && \
-#     cp /ultralytics/.env.example /tmp/SD_db_Library/SD_db_Library/../.env && \
-#     echo "✅ Environment file prepared for SD_db_Library"
 
 # Remove extra build files
 RUN rm -rf tmp /root/.config/Ultralytics/persistent_cache.json
