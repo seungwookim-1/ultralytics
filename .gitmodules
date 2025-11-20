@@ -1,0 +1,3 @@
+[submodule "SD_db_Library"]
+	path = SD_db_Library
+	url = https://github.com/SeoulDynamicsInc/SD_db_Library.git
