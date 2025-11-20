@@ -1,0 +1,151 @@
+# Ultralytics YOLO 🚀 with SD_db_Library Integration, AGPL-3.0 license
+# Enhanced Dockerfile for YOLOv11 with Seoul Dynamics database integration
+# Image is CUDA-optimized for YOLO11 single/multi-GPU training and inference with database logging
+
+# Start FROM PyTorch image https://hub.docker.com/r/pytorch/pytorch or nvcr.io/nvidia/pytorch:23.03-py3
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+# Set environment variables
+# Avoid DDP error "MKL_THREADING_LAYER=INTEL is incompatible with libgomp.so.1 library" https://github.com/pytorch/pytorch/issues/37377
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    MKL_THREADING_LAYER=GNU \
+    OMP_NUM_THREADS=1 
+
+# Downloads to user config dir
+ADD https://github.com/ultralytics/assets/releases/download/v0.0.0/Arial.ttf \
+    https://github.com/ultralytics/assets/releases/download/v0.0.0/Arial.Unicode.ttf \
+    /root/.config/Ultralytics/
+
+# Install linux packages
+# g++ required to build 'tflite_support' and 'lap' packages, libusb-1.0-0 required for 'tflite_support' package
+# libsm6 required by libqxcb to create QT-based windows for visualization; set 'QT_DEBUG_PLUGINS=1' to test in docker
+# Added mysql client libraries for SD_db_Library
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc git zip unzip wget curl htop libgl1 libglib2.0-0 libpython3-dev gnupg g++ libusb-1.0-0 libsm6 \
+    default-mysql-client libmariadb3 libmariadb-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Security updates
+# https://security.snyk.io/vuln/SNYK-UBUNTU1804-OPENSSL-3314796
+RUN apt upgrade --no-install-recommends -y openssl tar
+
+# Create working directory
+WORKDIR /ultralytics
+
+# Copy contents and configure git
+COPY . .
+RUN if [ -f .git/config ]; then \
+      sed -i '/^\[http "https:\/\/github\.com\/"\]/,+1d' .git/config; \
+    fi
+ADD https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt tmp/yolo11n.pt
+
+# Install pip packages
+RUN pip install uv
+
+# Copy and install SD_db_Library requirements first
+COPY docker/requirements-sd-db.txt /tmp/requirements-sd-db.txt
+RUN uv pip install --system -r /tmp/requirements-sd-db.txt
+
+# Temporarily remove SD_db_Library from dependencies to avoid build failure
+RUN sed -i '/SD_db_Library/d' pyproject.toml && sed -i '/PyMySQL/d' pyproject.toml
+
+# Install ultralytics and other packages (without SD_db_Library for now)
+RUN uv pip install --system -e ".[export]" "albumentations>=1.4.6" comet pycocotools ./SD_db_Library
+
+
+# Run exports to AutoInstall packages
+# Edge TPU export fails the first time so is run twice here
+RUN yolo export model=tmp/yolo11n.pt format=edgetpu imgsz=32 || yolo export model=tmp/yolo11n.pt format=edgetpu imgsz=32
+RUN yolo export model=tmp/yolo11n.pt format=ncnn imgsz=32
+# Requires <= Python 3.10, bug with paddlepaddle==2.5.0 https://github.com/PaddlePaddle/X2Paddle/issues/991
+RUN uv pip install --system "paddlepaddle>=2.6.0" x2paddle
+
+# Install SD_db_Library directly into the image (after main ultralytics installation)
+# Option 1: Copy from local directory during build (for development)
+# First copy SD_db_Library to the build context: cp -r /home/gihyukcho/library/SD_db_Library ./SD_db_Library
+# Then build with: docker build -f docker/Dockerfile-sd-db -t ultralytics/ultralytics:sd-db .
+COPY SD_db_Library /tmp/SD_db_Library
+RUN uv pip install --system -e /tmp/SD_db_Library
+
+# Option 2: Clone from git repository (when available)
+# RUN git clone https://github.com/SeoulDynamicsInc/SD_db_Library.git /tmp/SD_db_Library && \
+#     uv pip install --system -e /tmp/SD_db_Library && \
+#     rm -rf /tmp/SD_db_Library/.git
+
+# Option 3: Install from PyPI (if published)
+# RUN uv pip install --system SD_db_Library
+
+# Create directories for SD_db_Library
+RUN mkdir -p /ultralytics/data /ultralytics/logs /ultralytics/models
+
+# Copy environment template for SD_db_Library
+# COPY .env.example /ultralytics/.env.example
+
+# Create the .env file for SD_db_Library in the expected location
+# RUN mkdir -p /tmp/SD_db_Library/SD_db_Library/.. && \
+#     cp /ultralytics/.env.example /tmp/SD_db_Library/SD_db_Library/../.env && \
+#     echo "✅ Environment file prepared for SD_db_Library"
+
+# Remove extra build files
+RUN rm -rf tmp /root/.config/Ultralytics/persistent_cache.json
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import torch; print('CUDA available:', torch.cuda.is_available())" || exit 1
+
+# Usage Examples -------------------------------------------------------------------------------------------------------
+
+# Build and Push with SD_db_Library pre-installed
+# STEP 1: Copy SD_db_Library to build context first:
+# cp -r /home/gihyukcho/library/SD_db_Library ./SD_db_Library
+# STEP 2: Build the image:
+# t=ultralytics/ultralytics:sd-db && sudo docker build -f docker/Dockerfile-sd-db -t $t .
+
+# Simple run with pre-installed SD_db_Library and NAS mount
+# First mount NAS: sudo mount -t cifs //192.168.2.6/autonomous_driving /mnt/nas
+# t=ultralytics/ultralytics:sd-db && sudo docker run -it --ipc=host --gpus all \
+#   -v "$(pwd)"/.env:/ultralytics/.env \
+#   -v "$(pwd)"/data:/ultralytics/data \
+#   -v "$(pwd)"/outputs:/outputs \
+#   -v "$(pwd)"/run:/ultralytics/run \
+#   -v "$(pwd)"/scripts:/ultralytics/scripts \
+#   -v "$(pwd)"/chimera_core:/ultralytics/chimera_core \
+#   -v /mnt/nas:/mnt/nas \
+#   $t
+
+# For development: Build with local SD_db_Library copy
+# Before building, uncomment Option 2 above and update the COPY path
+# t=ultralytics/ultralytics:sd-db && sudo docker build -f docker/Dockerfile-sd-db -t $t . && \
+# sudo docker run -it --ipc=host --gpus all \
+#   -v "$(pwd)"/.env:/ultralytics/.env \
+#   -v "$(pwd)"/data:/ultralytics/data \
+#   -v "$(pwd)"/outputs:/ultralytics/outputs \
+#   $t
+
+# Run with database access and local directory mounting
+# t=ultralytics/ultralytics:sd-db && sudo docker run -it --ipc=host --gpus all \
+#   -v "$(pwd)"/.env:/ultralytics/.env \
+#   -v "$(pwd)"/.env:/tmp/SD_db_Library/SD_db_Library/../.env \
+#   -v "$(pwd)"/data:/ultralytics/data \
+#   -v "$(pwd)"/outputs:/ultralytics/outputs \
+#   -p 8000:8000 $t
+
+# Interactive container with all mounts including NAS (SD_db_Library pre-installed)
+# sudo docker run -it --ipc=host --gpus all \
+#   -v "$(pwd)"/.env:/ultralytics/.env \
+#   -v "$(pwd)"/.env:/tmp/SD_db_Library/SD_db_Library/../.env \
+#   -v "$(pwd)"/data:/ultralytics/data \
+#   -v "$(pwd)"/outputs:/ultralytics/outputs \
+#   -v "$(pwd)"/run:/ultralytics/run \
+#   -v /mnt/nas:/mnt/nas \
+#   ultralytics/ultralytics:sd-db bash
+
+# Train with database logging
+# docker exec -it <container_id> python run/go_train.py
+
+# Run inference with database logging
+# docker exec -it <container_id> python run/go_test.py
