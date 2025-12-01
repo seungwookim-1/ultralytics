@@ -314,9 +314,11 @@ class MoEDetectionLoss(v8DetectionLoss):
 
         Args:
             model: The detection model instance.
-        """
+        """        
         super().__init__(model)
+        self.model = model
         self.aux_loss_weight = getattr(model.args, "moe_aux_loss", 0.01)
+
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate total loss including detection loss and MoE auxiliary loss.
@@ -328,19 +330,19 @@ class MoEDetectionLoss(v8DetectionLoss):
         Returns:
             (tuple): Total loss and loss items tensor.
         """
-        if isinstance(preds, tuple) and len(preds) == 2:
-            predictions, aux_loss = preds
-        else:
-            predictions = preds
-            aux_loss = torch.tensor(0.0, device=self.device)
+        
+        detection_loss, loss_items = super().__call__(preds, batch)
+        head = self.model.model[-1]
+        aux_loss = getattr(head, "moe_aux_loss", 0.01)
 
-        detection_loss, loss_items = super().__call__(predictions, batch)
+        if (not self.model.training) or (aux_loss is None):
+            return detection_loss, loss_items
 
-        total_loss = detection_loss + aux_loss
+        total_loss = detection_loss + self.aux_loss_weight * aux_loss
 
-        loss_items_with_aux = torch.cat([loss_items, aux_loss.detach().unsqueeze(0)])
+        # loss_items_with_aux = torch.cat([loss_items, aux_loss.detach().unsqueeze(0)])
 
-        return total_loss, loss_items_with_aux
+        return total_loss, loss_items
 
 
 class v8SegmentationLoss(v8DetectionLoss):

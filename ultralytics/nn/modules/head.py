@@ -1298,7 +1298,7 @@ class MoEDetect(Detect):
         aux_loss_weight (float): Weight for auxiliary load balancing loss.
     """
 
-    def __init__(self, nc: int = 80, ch: tuple = (), num_experts: int = 4):
+    def __init__(self, nc: int = 80, num_experts: int = 4, ch: tuple = ()):
         """Initialize MoEDetect with number of classes, channels, and experts.
 
         Args:
@@ -1319,6 +1319,7 @@ class MoEDetect(Detect):
 
         self.register_buffer("expert_counts", torch.zeros(num_experts))
         self.aux_loss_weight = 0.01
+        self.moe_aux_loss: torch.Tensor | None = None
 
     def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor] | tuple:
         """Forward pass with mixture-of-experts routing.
@@ -1357,12 +1358,31 @@ class MoEDetect(Detect):
                 with torch.no_grad():
                     self.expert_counts += routing_weights.sum(dim=0)
 
+        # 1) dummy forward for building (stride == 0) : returns list[Tensor]
+        building_stage = (
+            self.stride is not None
+            and self.stride.numel() == self.nl
+            and (self.stride == 0).all()
+            and not self.export
+        )
+        if building_stage:
+            return outputs
+
+        # 3) training : return aux_loss
         if self.training:
             aux_loss = self._compute_load_balance_loss(router_info)
-            return outputs, aux_loss
+            # with torch.no_grad():
+            #     # (optional)expert_counts update
+            #     for routing_weights, _ in router_info:
+            #         self.expert_counts += routing_weights.sum(dim=0)
+            self.moe_aux_loss = aux_loss
+            return outputs
 
+        # 4) val/export : return inference output
+        self.moe_aux_loss = None
         y = self._inference(outputs)
         return y if self.export else (y, outputs)
+
 
     def _compute_load_balance_loss(self, router_info: list) -> torch.Tensor:
         """Compute auxiliary load balancing loss.
