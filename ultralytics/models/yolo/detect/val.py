@@ -152,6 +152,46 @@ class DetectionValidator(BaseValidator):
             "im_file": batch["im_file"][si],
         }
 
+    def _process_batch(self, preds, batch):
+        """
+        preds: dict with 'bboxes', 'cls' (보통 self._prepare_pred 결과)
+        batch: dict with 'bboxes', 'cls' (self._prepare_batch 결과)
+
+        반환: {"tp": tp_tensor}, tp.shape = (num_pred, self.niou)
+        """
+
+        # GT가 아예 없으면, 예측 수만큼 0으로 채운 tp 반환
+        if batch["cls"].numel() == 0 or preds["cls"].numel() == 0:
+            tp = torch.zeros((preds["cls"].shape[0], self.niou), dtype=torch.bool, device=self.device)
+            return {"tp": tp}
+
+        # 1) 디바이스 정렬
+        gt_boxes = batch["bboxes"].to(self.device)
+        gt_cls = batch["cls"].to(self.device)
+
+        pred_boxes = preds["bboxes"]
+        pred_cls = preds["cls"]
+
+        if not isinstance(pred_boxes, torch.Tensor):
+            pred_boxes = torch.as_tensor(pred_boxes, device=self.device, dtype=gt_boxes.dtype)
+        else:
+            pred_boxes = pred_boxes.to(self.device, dtype=gt_boxes.dtype)
+
+        if not isinstance(pred_cls, torch.Tensor):
+            pred_cls = torch.as_tensor(pred_cls, device=self.device, dtype=gt_cls.dtype)
+        else:
+            pred_cls = pred_cls.to(self.device, dtype=gt_cls.dtype)
+
+        preds["bboxes"] = pred_boxes
+        preds["cls"] = pred_cls
+
+        # 2) IoU 계산 및 매칭
+        iou = box_iou(gt_boxes, pred_boxes)  # (num_gt, num_pred)
+        tp = self.match_predictions(pred_cls, gt_cls, iou)
+
+        return {"tp": tp}
+
+
     def _prepare_pred(self, pred: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Prepare predictions for evaluation against ground truth.
 
@@ -165,50 +205,62 @@ class DetectionValidator(BaseValidator):
             pred["cls"] *= 0
         return pred
 
-    def update_metrics(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
-        """Update metrics with new predictions and ground truth.
+    def update_metrics(self, preds, batch):
 
-        Args:
-            preds (list[dict[str, torch.Tensor]]): List of predictions from the model.
-            batch (dict[str, Any]): Batch data containing ground truth.
-        """
         for si, pred in enumerate(preds):
             self.seen += 1
+
+            # 1) 배치/예측 준비
             pbatch = self._prepare_batch(si, batch)
             predn = self._prepare_pred(pred)
 
-            cls = pbatch["cls"].cpu().numpy()
+            # 2) GT / pred 존재 여부
             no_pred = predn["cls"].shape[0] == 0
-            self.metrics.update_stats(
-                {
-                    **self._process_batch(predn, pbatch),
-                    "target_cls": cls,
-                    "target_img": np.unique(cls),
-                    "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
-                    "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
-                }
-            )
-            # Evaluate
+            no_gt = pbatch["cls"].shape[0] == 0
+
+            # 3) tp 계산 (IoU 매트릭스)
+            if no_pred or no_gt:
+                tp = torch.zeros((0, self.niou), dtype=torch.bool, device=self.device)
+            else:
+                out = self._process_batch(predn, pbatch)
+                tp = out["tp"]
+
+            # 4) conf / pred_cls / target_cls 텐서 준비
+            if no_pred:
+                conf_val = torch.zeros(0, device=self.device)
+                pred_cls_val = torch.zeros(0, device=self.device)
+            else:
+                conf_val = predn["conf"].to(self.device)
+                pred_cls_val = predn["cls"].to(self.device)
+
+            target_cls_val = pbatch["cls"].to(self.device)
+
+            # 5) DetMetrics가 기대하는 dict 형태로 변환 (모두 CPU numpy)
+            cls_np = target_cls_val.detach().cpu().numpy()
+            stat = {
+                "tp": tp.detach().cpu().numpy(),
+                "conf": conf_val.detach().cpu().numpy(),
+                "pred_cls": pred_cls_val.detach().cpu().numpy(),
+                "target_cls": cls_np,
+                # Ultralytics 최신 코드와 동일하게: per-class 카운트용 pseudo "target_img"
+                "target_img": np.unique(cls_np),
+            }
+
+            # 6) 새 API에 맞춰 호출
+            self.metrics.update_stats(stat)
+
+            # 7) confusion matrix 및 시각화
             if self.args.plots:
                 self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
                 if self.args.visualize:
-                    self.confusion_matrix.plot_matches(batch["img"][si], pbatch["im_file"], self.save_dir)
+                    self.confusion_matrix.plot_matches(
+                        batch["img"][si], pbatch["im_file"], self.save_dir
+                    )
+                    
+            if not hasattr(self, "_debug_once"):
+                print(f"[VAL DEBUG] si={si}, num_gt={target_cls_val.numel()}, num_pred={predn['cls'].numel()}")
+                self._debug_once = True
 
-            if no_pred:
-                continue
-
-            # Save
-            if self.args.save_json or self.args.save_txt:
-                predn_scaled = self.scale_preds(predn, pbatch)
-            if self.args.save_json:
-                self.pred_to_json(predn_scaled, pbatch)
-            if self.args.save_txt:
-                self.save_one_txt(
-                    predn_scaled,
-                    self.args.save_conf,
-                    pbatch["ori_shape"],
-                    self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
-                )
 
     def finalize_metrics(self) -> None:
         """Set final values for metrics speed and confusion matrix."""
@@ -271,21 +323,46 @@ class DetectionValidator(BaseValidator):
                     )
                 )
 
-    def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
-        """Return correct prediction matrix.
+    # def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
+    #     """Return correct prediction matrix.
 
-        Args:
-            preds (dict[str, torch.Tensor]): Dictionary containing prediction data with 'bboxes' and 'cls' keys.
-            batch (dict[str, Any]): Batch dictionary containing ground truth data with 'bboxes' and 'cls' keys.
+    #     Args:
+    #         preds (dict[str, torch.Tensor]): Dictionary with 'bboxes' and 'cls'.
+    #         batch (dict[str, Any]): Batch dict with GT 'bboxes' and 'cls'.
 
-        Returns:
-            (dict[str, np.ndarray]): Dictionary containing 'tp' key with correct prediction matrix of shape (N, 10) for
-                10 IoU levels.
-        """
-        if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
-            return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
-        iou = box_iou(batch["bboxes"], preds["bboxes"])
-        return {"tp": self.match_predictions(preds["cls"], batch["cls"], iou).cpu().numpy()}
+    #     Returns:
+    #         dict[str, np.ndarray]: {'tp': (N, niou) bool matrix}
+    #     """
+    #     # GT / Pred에 아무 것도 없으면 early-return
+    #     if batch["cls"].shape[0] == 0 or preds["cls"].shape[0] == 0:
+    #         return {"tp": np.zeros((preds["cls"].shape[0], self.niou), dtype=bool)}
+
+    #     # --- 1) 박스 정리 ---
+    #     gt_boxes = batch["bboxes"]           # Tensor on cuda
+    #     pred_boxes = preds["bboxes"]         # Tensor or numpy on cpu
+
+    #     if isinstance(pred_boxes, np.ndarray):
+    #         pred_boxes = torch.from_numpy(pred_boxes)
+
+    #     # gt와 같은 device / dtype으로 맞춤
+    #     pred_boxes = pred_boxes.to(gt_boxes.device).type_as(gt_boxes)
+    #     preds["bboxes"] = pred_boxes
+
+    #     # --- 2) 클래스 정리 ---
+    #     gt_cls = batch["cls"]                # Tensor on cuda
+    #     pred_cls = preds["cls"]              # Tensor or numpy on cpu
+
+    #     if isinstance(pred_cls, np.ndarray):
+    #         pred_cls = torch.from_numpy(pred_cls)
+
+    #     pred_cls = pred_cls.to(gt_cls.device).type_as(gt_cls)
+    #     preds["cls"] = pred_cls
+
+    #     # --- 3) IoU 계산 + 매칭 ---
+    #     iou = box_iou(gt_boxes, pred_boxes)  # 같은 device라 문제 없음
+
+    #     tp = self.match_predictions(pred_cls, gt_cls, iou).cpu().numpy()
+    #     return {"tp": tp}
 
     def build_dataset(self, img_path: str, mode: str = "val", batch: int | None = None) -> torch.utils.data.Dataset:
         """Build YOLO Dataset.

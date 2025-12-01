@@ -277,6 +277,15 @@ class v8DetectionLoss:
             mask_gt,
         )
 
+        if not hasattr(self, "_chimera_debug_done"):
+            self._chimera_debug_done = True
+            print(
+                "[v8DetLoss DEBUG] batch_size=", batch_size,
+                "target_scores_sum=", float(target_scores.sum()),
+                "fg_mask_sum=", int(fg_mask.sum()),
+                "num_gt_per_img=", mask_gt.sum(dim=(1, 2)).tolist(),
+            )
+
         target_scores_sum = max(target_scores.sum(), 1)
 
         # Cls loss

@@ -1180,3 +1180,80 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
+
+class ChimeraDetect(nn.Module):
+    """
+    여러 개의 YOLO Detect 헤드를 동시에 돌리는 멀티헤드 모듈.
+
+    YAML 예:
+        - [[16, 19, 22], 1, ChimeraDetect, [34, 19]]
+
+    parse_model() 호출:
+        ChimeraDetect(head_ncs=[34, 19], ch=[c3, c4, c5])
+    """
+
+    legacy = False  # Detect와 인터페이스 정합용
+
+    def __init__(self, head_ncs, ch, *args, **kwargs):
+        """
+        Args:
+            head_ncs: [nc1, nc2, ...] 형태의 리스트 (예: [34, 19])
+            ch      : FPN 출력 채널 리스트 [C3, C4, C5]
+        """
+        super().__init__()
+
+        # head_ncs 정규화
+        if isinstance(head_ncs, (int, float)):
+            head_ncs = [int(head_ncs)]
+        elif isinstance(head_ncs, (list, tuple)):
+            head_ncs = [int(nc) for nc in head_ncs]
+        else:
+            raise TypeError(f"ChimeraDetect head_ncs 타입이 이상합니다: {type(head_ncs)}")
+
+        # if len(head_ncs) < 2:
+        #     raise ValueError(f"ChimeraDetect head_ncs 길이가 2 미만입니다: {head_ncs}")
+
+        self.head_ncs = head_ncs
+
+        if not isinstance(ch, (list, tuple)):
+            raise TypeError(f"ChimeraDetect ch는 list/tuple 이어야 합니다. got={type(ch)}")
+        ch = tuple(ch)
+
+        # 🔥 핵심: nn.ModuleList 안에 Detect들을 넣어야 PyTorch가 서브모듈로 인식한다
+        self.heads = nn.ModuleList([
+            Detect(nc=nc, ch=ch, *args, **kwargs) for nc in self.head_ncs
+        ])
+
+        # 편의상 첫 번째 헤드를 main, 두 번째를 aux로 alias
+        if len(self.heads) >= 1:
+            self.detect_main = self.heads[0]
+        if len(self.heads) >= 2:
+            self.detect_aux = self.heads[1]
+
+        # Detect 메타 정보 일부를 노출
+        self.stride = self.heads[0].stride
+        self.export = getattr(self.heads[0], "export", False)
+        self.end2end = getattr(self.heads[0], "end2end", False)
+        self.no = None  # 각 Detect가 개별적으로 no를 가짐
+
+    def forward(self, x):
+        """
+        x: FPN 출력 feature list [P3, P4, P5]
+
+        반환:
+            학습 모드: [out_head0, out_head1, ...] (각 out_head는 Detect.forward 결과)
+        """
+        outputs = []
+        for head in self.heads:
+            # Detect.forward 가 내부에서 in-place 변형 할 수 있으니 복사본 사용
+            if isinstance(x, (list, tuple)):
+                x_copy = [t for t in x]
+            else:
+                x_copy = x
+            outputs.append(head(x_copy))
+        return outputs
+
+    def bias_init(self):
+        for head in self.heads:
+            if hasattr(head, "bias_init"):
+                head.bias_init()

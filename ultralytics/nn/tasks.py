@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import contextlib
+import enum
 import pickle
 import re
 import types
@@ -69,8 +70,9 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    ChimeraDetect
 )
-from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
+from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis, ops
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2EDetectLoss,
@@ -483,251 +485,633 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
-    
-    def _ensure_detect_hook(self):
-        """Register a forward_pre_hook on the Detect head to capture its input feature maps (P3/P4/P5)."""
-        if not hasattr(self, "_detect_hook") or self._detect_hook is None:
-            # de_parallel: DDP 래핑 제거 후 실제 모듈 얻기
-            detect = self.model[-1]
-            assert isinstance(detect, Detect), "Last module must be Detect (or subclass)."
-            self._pyramid = None  # will be filled at forward
-            def _pre_hook(module, inputs):
-                # inputs: tuple([p3, p4, p5]) 형태
-                feats = inputs[0] if isinstance(inputs, (list, tuple)) else inputs
-                # 보통 순서는 [P3(8x), P4(16x), P5(32x)] 이지만, 안전하게 len 체크
-                if isinstance(feats, (list, tuple)) and len(feats) >= 3:
-                    self._pyramid = {
-                        "P3": feats[0],
-                        "P4": feats[1],
-                        "P5": feats[2],
-                    }
-                else:
-                    # 단일 피처만 들어오는 변형 대응
-                    self._pyramid = {"P3": feats}
-            self._detect_hook = detect.register_forward_pre_hook(_pre_hook)
 
-    @torch.no_grad()  # teacher 측에서 자주 쓸 수 있으니 기본 no_grad 권장(필요 시 해제)
-    def forward_features(self, x: torch.Tensor, normalize: bool = True) -> dict[str, torch.Tensor]:
-        """
-        Returns neck outputs just before Detect: {'P3': ..., 'P4': ..., 'P5': ...}.
-        """
-        self._ensure_detect_hook()
-        _ = self.forward(x)  # 일반 forward를 호출하면 훅이 입력 피처를 채움
-        feats = self._pyramid
-        if feats is None:
-            raise RuntimeError("Detect hook didn't capture features. Check Detect location or forward path.")
-        if normalize:
-            # 채널 방향 정규화(증류 안정화에 도움)
-            feats = {k: F.normalize(v, dim=1) for k, v in feats.items() if v is not None}
-        return feats
-
-
-# 추가 코드
-class SceneHead(nn.Module):
-    def __init__(self, in_ch, nc):
+class _HeadLossProxy(nn.Module):
+    """
+    단일 Detect 헤드를 v8DetectionLoss가 기대하는 형태(BaseModel 비슷한 인터페이스)로 감싸는 래퍼.
+    """
+    def __init__(self, detect_head: nn.Module, args):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(in_ch, nc)
-    def forward(self, feats, targets=None):
-        # feats: parse_model 후 Detect 직전의 피처 피라미드 중 최상단(예: P5) 사용
-        P5 = feats[-1] if isinstance(feats, (list, tuple)) else feats
-        z = self.pool(P5).flatten(1)
-        logits = self.fc(z)
-        if self.training:
-            if logits.ndim == 1: logits = logits.unsqueeze(0)
-            loss = nn.CrossEntropyLoss()(logits, targets)  # 다중라벨이면 BCEWithLogitsLoss
-            return {"loss": loss, "logits": logits}
-        return {"logits": logits}
+        # 1) Detect 모듈만 들고 있는 작은 model 처럼 구성
+        self.model = nn.ModuleList([detect_head])
+        self.args = args
+
+        # 2) 🔥 stride가 0이면, nl 기준으로 합리적인 기본 stride를 넣어준다.
+        m = self.model[-1]
+        if hasattr(m, "stride"):
+            stride = m.stride
+            if isinstance(stride, torch.Tensor):
+                if (stride == 0).all():
+                    nl = getattr(m, "nl", 3)
+                    base = 8.0
+                    vals = [base * (2 ** i) for i in range(nl)]  # [8, 16, 32, ...]
+                    m.stride = torch.tensor(vals, device=stride.device)
+            else:
+                try:
+                    if all(s == 0 for s in stride):
+                        nl = getattr(m, "nl", len(stride))
+                        base = 8.0
+                        vals = [base * (2 ** i) for i in range(nl)]
+                        m.stride = torch.tensor(vals, device=next(m.parameters()).device)
+                except Exception:
+                    pass
+
+    def to(self, device):
+        self.model.to(device)
+        return self
+
+    def parameters(self):
+        return self.model.parameters()
 
 
-class MultiHeadTail(nn.Module):
-    """
-    Multi-head detection module that replaces the final Detect layer.
-    Creates separate detection heads for different task types.
-    """
-    def __init__(self, base_detect: Detect, head_defs: dict, lambdas: dict = None):
-        super().__init__()
-        self.head_defs = head_defs
-        self.lambdas = lambdas or {k: 1.0 for k in head_defs.keys()}
-        self.detect_heads = nn.ModuleDict()
-        
-        # Copy attributes from base_detect that are needed for YOLO forward loop
-        self.f = base_detect.f  # from which layers
-        self.i = base_detect.i  # index in model
-        self.type = "MultiHeadTail"  # module type
-        
-        # Store base detect properties
-        self.nl = base_detect.nl  # number of detection layers
-        self.reg_max = base_detect.reg_max
-        self.stride = base_detect.stride
-        self.nc_base = base_detect.nc
-        
-        # Get input channel info for each detection layer
-        # These are the channels coming from the neck (P3, P4, P5)
-        input_channels = [base_detect.cv2[i][0].conv.in_channels for i in range(base_detect.nl)]
-        
-        # Create separate Detect head for each task
-        for head_name, head_cfg in head_defs.items():
-            nc = head_cfg.get("nc", 80)
-            
-            # Deep copy the entire head first
-            head = deepcopy(base_detect)
-            head.nc = nc
-            
-            # Now rebuild cv3 to output nc classes instead of base_detect.nc
-            # The cv3 structure is: Sequential(DWConv, Conv, final_conv)
-            # We need to replace only the final conv layer
-            
-            new_cv3 = nn.ModuleList()
-            for i in range(head.nl):
-                # Get the existing cv3 sequential from the COPIED head
-                old_cv3 = head.cv3[i]
-                
-                # Get dimensions from the second-to-last layer's output
-                c_hidden = old_cv3[-1].in_channels
-                
-                # Build new cv3: keep first two layers from copied head, replace final layer
-                new_seq = nn.Sequential(
-                    old_cv3[0],  # DWConv from copied head
-                    old_cv3[1],  # Conv from copied head
-                    nn.Conv2d(c_hidden, nc, 1, bias=False)  # New classification layer
-                )
-                new_cv3.append(new_seq)
-            
-            head.cv3 = new_cv3
-            
-            # Update no (number of outputs per anchor)
-            head.no = head.cv2[0][-1].out_channels + nc
-            
-            self.detect_heads[head_name] = head
-        
-        # Use first head's properties
-        first_head = next(iter(self.detect_heads.values()))
-        self.no = 4 + self.nc_base  # Keep base nc for module compatibility
-        
-    def forward(self, x):
-        """
-        Forward pass through all heads.
-        
-        Args:
-            x: List of feature maps from neck [P3, P4, P5]
-            
-        Returns:
-            Dict of outputs from each head
-        """
-        outputs = {}
-        for head_name, head in self.detect_heads.items():
-            outputs[head_name] = head(x)
-        return outputs
-
-
-
-class MultiHeadDetectionModel(DetectionModel):
-    """
-    YOLOv11 model with multiple detection heads sharing a single backbone.
-    """
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True,
-                 head_defs: dict = None, lambdas: dict = None):
-        """
-        Args:
-            cfg: Model configuration file
-            ch: Number of input channels
-            nc: Number of classes (ignored when using head_defs)
-            verbose: Print model details
-            head_defs: Dict defining each head, e.g.:
-                {"vehicle": {"type": "detect", "nc": 8},
-                 "vru": {"type": "detect", "nc": 2},
-                 "scene": {"type": "classify", "nc": 5}}
-            lambdas: Loss weights for each head, e.g.:
-                {"vehicle": 1.0, "vru": 1.0, "scene": 10.0}
-        """
-        # Initialize base model first with default nc
-        super().__init__(cfg, ch, nc or 80, verbose)
-        
-        self.head_defs = head_defs
+class ChimeraDetectionModel(DetectionModel):
+    def __init__(self, cfg="yolo11-chimera.yaml", ch=3, nc=None, verbose=True, lambdas=None):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         self.lambdas = lambdas or {}
-        
-        if head_defs:
-            # Replace final Detect layer with MultiHeadTail
-            last = self.model[-1]
-            assert isinstance(last, Detect), "Last module must be Detect for multi-head"
-            
-            # Create multi-head module
-            mh = MultiHeadTail(last, head_defs, lambdas)
-            self.model[-1] = mh
-            
-            # Update stride (already computed by parent __init__)
-            self.model[-1].stride = self.stride
-            for head in self.model[-1].detect_heads.values():
-                head.stride = self.stride
-    
-    def forward(self, x, targets: dict = None):
+        # 기본 람다값
+        self.lambdas.setdefault("nonmoving", 1.0)
+        self.lambdas.setdefault("rider", 1.0)
+
+        self._head_meta_built = False
+        self.head_meta = {}  # head_name -> {global_ids, g2l, nc}
+
+
+    def _build_head_meta_from_data(self):
         """
-        Forward pass.
-        
-        Args:
-            x: Input tensor [B, C, H, W]
-            targets: Dict of targets for each head (training only)
-                {"vehicle": [...], "vru": [...], ...}
-        
-        Returns:
-            Training: {"total_loss": loss, "per_head": {head: loss, ...}}
-            Inference: {head_name: predictions, ...}
+        self.data['multi_heads']를 읽어서
+        head별로 global->local 클래스 매핑을 만든다.
         """
-        # Forward through backbone and neck (same as parent class)
-        y = []
-        for m in self.model:
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
-            x = m(x)
-            y.append(x if m.i in self.save else None)
-        
-        # x is now the multi-head outputs dict
-        if self.training and targets is not None:
-            return self._forward_train(x, targets)
-        else:
-            return x  # Dict of head outputs
-    
-    def _forward_train(self, outputs, targets):
-        """Training forward pass with loss computation."""
-        head_losses = {}
-        total_loss = 0.0
-        
-        for head_name, head in self.model[-1].detect_heads.items():
-            if head_name in targets:
-                pred = outputs[head_name]
-                
-                # Compute loss using head's built-in loss
-                if hasattr(head, 'loss'):
-                    loss = head.loss(pred, targets[head_name])
+
+        if not hasattr(self, "_head_meta_built"):
+            self._head_meta_built = False
+
+        if self._head_meta_built:
+            return
+
+        if not hasattr(self, "data") or self.data is None:
+            LOGGER.warning(
+            "[ChimeraDetection] self.data 가 비어 있습니다. "
+            "trainer/validator에서 model.data 를 세팅하기 전의 더미 predict 호출일 수 있습니다."
+            )
+            return
+
+        mh_cfg = self.data.get("multi_heads", None)
+        if mh_cfg is None:
+            LOGGER.warning(
+                "[ChimeraDetection] data.yaml 에 multi_heads 설정이 없습니다. "
+                "ChimeraDetectionModel 을 사용하려면 data.yaml 에 multi_heads 를 정의해야 합니다."
+            )
+            return
+
+        meta = {}
+        for head_name, cfg in mh_cfg.items():
+            class_ids = cfg.get("class_ids", None)
+            if not class_ids:
+                raise ValueError(f"multi_heads.{head_name}.class_ids 가 비어있습니다.")
+            # global id -> head local id
+            g2l = {int(g): i for i, g in enumerate(class_ids)}
+            meta[head_name] = {
+                "global_ids": [int(g) for g in class_ids],
+                "g2l": g2l,
+                "nc": len(class_ids),
+            }
+
+            # 람다 기본값 없으면 1.0
+            self.lambdas.setdefault(head_name, 1.0)
+
+        self.head_meta = meta
+        self._head_meta_built = True
+
+        if not hasattr(self, "_head_meta_debugged"):
+            debug_meta = {
+                k: {
+                    "nc": v["nc"],
+                    "global_ids": v["global_ids"],
+                }
+                for k, v in meta.items()
+            }
+            print("[ChimeraDetection][DEBUG] head_meta:", debug_meta)
+            self._head_meta_debugged = True
+
+        print("[DEBUG] type(self.data) =", type(self.data))
+        print("[DEBUG] data.keys() =", list(self.data.keys()))
+        print("[DEBUG] names =", self.data.get("names"))
+        print("[DEBUG] type(names) =", type(self.data.get("names")))
+
+    def _normalize_head_output(self, head_name: str, head_pred_raw):
+        """
+        head별 출력을 (B, A, C) 텐서로 정규화해서 돌려준다.
+        - box_ch: 4
+        - nc_head: 이 head가 담당하는 로컬 클래스 개수
+        """
+        if not hasattr(self, "data") or self.data is None or "multi_heads" not in getattr(self, "data", {}):
+            if isinstance(head_pred_raw, tuple):
+                decoded_like, raw_feats = head_pred_raw
+                # decoded_like가 이미 (B, C, A)이면 그걸 그대로 쓰고, 아니면 detect._inference 사용
+                if isinstance(decoded_like, torch.Tensor) and decoded_like.ndim == 3:
+                    y = decoded_like
                 else:
-                    # Need to implement loss calculation
-                    loss = self._compute_detection_loss(pred, targets[head_name], head)
+                    detect = self._head_to_detect.get(head_name, None) if hasattr(self, "_head_to_detect") else None
+                    if detect is not None and isinstance(raw_feats, (list, tuple)):
+                        y = detect._inference(list(raw_feats))
+                    else:
+                        raise RuntimeError("Chimera: dummy forward에서 head_pred_raw 해석 불가")
+            elif isinstance(head_pred_raw, torch.Tensor) and head_pred_raw.ndim == 3:
+                y = head_pred_raw
+            else:
+                # 최소한 크기만 맞는 텐서로 반환
+                raise RuntimeError("Chimera: dummy forward fallback 처리 필요")
                 
-                # Apply lambda weighting
-                weighted_loss = loss * self.lambdas.get(head_name, 1.0)
-                head_losses[head_name] = weighted_loss
-                total_loss += weighted_loss
-        
-        return {
-            "total_loss": total_loss,
-            "per_head": head_losses
-        }
-    
-    def _compute_detection_loss(self, pred, targets, head):
+        # 1) head_meta 보장
+        self._build_head_meta_from_data()
+        if not hasattr(self, "_head_to_detect") or self._head_to_detect is None:
+            self.init_criterion()
+
+        # 2) head_pred_raw 해석
+        if isinstance(head_pred_raw, tuple):
+            # tuple 구조: (decoded_like, raw_feats)
+            decoded_like, raw_feats = head_pred_raw
+
+            # 여기서는 이미 디코딩된 출력(decoded_like)을 그대로 사용
+            if not isinstance(decoded_like, torch.Tensor) or decoded_like.ndim != 3:
+                raise TypeError(
+                    f"[ChimeraDetection] head '{head_name}' decoded_like shape/type 이상: "
+                    f"type={type(decoded_like)}, ndim={getattr(decoded_like, 'ndim', None)}"
+                )
+            y = decoded_like
+
+            print(f"\n[TUPLE DEBUG] head={head_name}")
+            print("  decoded_like.shape =", decoded_like.shape)
+            if isinstance(raw_feats, (list, tuple)) and len(raw_feats) > 0:
+                print("  raw_feats[0].shape =", raw_feats[0].shape)
+
+        elif isinstance(head_pred_raw, (list, tuple)):
+            # 이 경우에만 feature map list → _inference
+            detect = self._head_to_detect[head_name]
+            y = detect._inference(list(head_pred_raw))
+
+        elif isinstance(head_pred_raw, torch.Tensor):
+            # 이미 (B, C_tot, A) 텐서라면 그대로 사용
+            if head_pred_raw.ndim != 3:
+                raise ValueError(
+                    f"[ChimeraDetection] head '{head_name}' tensor output ndim={head_pred_raw.ndim}, expected 3."
+                )
+            y = head_pred_raw
+
+        else:
+            raise TypeError(
+                f"[ChimeraDetection] head '{head_name}' output type not supported: {type(head_pred_raw)}"
+            )
+
+        if not torch.isfinite(y).all():
+            # 요약/더미 forward 같은 경우 여기서 정리
+            y = torch.nan_to_num(y, nan=0.0, posinf=1e3, neginf=-1e3)
+
+        # 3) 이제 y는 (B, C_tot, A) 텐서여야 한다
+        if not isinstance(y, torch.Tensor) or y.ndim != 3:
+            raise ValueError(
+                f"[ChimeraDetection] head '{head_name}' normalized y.ndim={getattr(y, 'ndim', None)}, expected 3."
+            )
+
+        B, C_tot, A = y.shape
+        box_ch = 4
+        nc_head = C_tot - box_ch
+        if nc_head <= 0:
+            raise ValueError(
+                f"[ChimeraDetection] head '{head_name}' invalid C_tot={C_tot}, box_ch={box_ch}"
+            )
+
+        # 디버그
+        print(f"\n[Norm DEBUG] head={head_name}")
+        print("  y.shape =", y.shape)
+        print("  box_ch =", box_ch, "nc_head =", nc_head)
+        with torch.no_grad():
+            box_all = y[:, :box_ch, :].flatten()  # (B*4*A,)
+            print("  box_all_abs_sum =", float(box_all.abs().sum()))
+            print("  box_all_max =", float(box_all.max()))
+            print("  box_all_min =", float(box_all.min()))
+
+            print("box_all_abs_sum_fp32 =", float(box_all.float().abs().sum()))
+            print("has_inf =", bool(torch.isinf(box_all).any()))
+            print("has_nan =", bool(torch.isnan(box_all).any()))
+
+        # (B, C, A) → (B, A, C)
+        y = y.permute(0, 2, 1).contiguous()
+        return y, nc_head, box_ch
+
+
+    def predict(self, x, augment=False, profile=False, visualize=False, embed=None):
         """
-        Fallback loss computation if head doesn't have built-in loss.
+        멀티헤드 예측을 global class 53개로 합쳐서
+        validator/NMS가 기대하는 단일 head 예측((B, A, 4+53))으로 반환.
         """
-        # This requires integration with ultralytics loss functions
-        # For now, return dummy loss
-        return torch.tensor(0.0, device=pred[0].device if isinstance(pred, (list, tuple)) else pred.device, 
-                          requires_grad=True)
-    
+        # 0) 아직 data/multi_heads가 안 붙은 "cold start" 호출이면
+        #    그냥 기본 DetectionModel.predict로 넘긴다 (stride warmup 등)
+        if (
+            not hasattr(self, "data")
+            or self.data is None
+            or "multi_heads" not in self.data
+        ):
+            return super().predict(x, augment=augment,
+                                profile=profile,
+                                visualize=visualize,
+                                embed=embed)
+
+        # 1) raw multi-head preds 얻기
+        preds = self._predict_once(x, profile=profile, visualize=visualize, embed=embed)
+
+        # 2) head_meta 준비 (여기서는 이미 self.data/multi_heads가 있다고 가정)
+        self._build_head_meta_from_data()
+        if not getattr(self, "head_meta", None):
+            LOGGER.warning(
+                "[ChimeraDetection] head_meta가 비어 있습니다. "
+                "data.yaml의 multi_heads 설정을 확인하세요. "
+                "임시로 기본 DetectionModel.predict를 사용합니다."
+            )
+            return super().predict(x, augment=augment,
+                                profile=profile,
+                                visualize=visualize,
+                                embed=embed)
+
+        if not hasattr(self, "_head_to_detect") or self._head_to_detect is None:
+            self.init_criterion()
+
+        # head 이름들 (예: ["nonmoving", "rider"])
+        head_names = list(self.head_meta.keys())
+        num_global_classes = len(self.data["names"])
+
+        # preds 타입에 따라 dict로 정규화
+        if isinstance(preds, dict):
+            head_preds = preds
+        else:
+            head_preds = {name: p for name, p in zip(head_names, preds)}
+
+        # 2) 기준 head = 첫 head
+        ref_head = head_names[0]
+        ref_flat, ref_nc, box_ch = self._normalize_head_output(ref_head, head_preds[ref_head])
+
+        print("\n=== DEBUG C1: reference head flat ===")
+        print("  ref_head =", ref_head)
+        print("  flat.shape =", ref_flat.shape)  # (B, A, C)
+        print("  ref_nc =", ref_nc)
+        print("  box_ch =", box_ch)
+        print("  expected total C =", box_ch + ref_nc)
+
+        B, A, _ = ref_flat.shape
+
+        # 3) global 출력 텐서 준비: (B, A, box_ch + num_global_classes)
+        C_global = box_ch + num_global_classes
+        global_flat = ref_flat.new_zeros((B, A, C_global))
+
+        # 박스 부분은 기준 head의 것을 사용
+        global_flat[..., :box_ch] = ref_flat[..., :box_ch]
+
+        # 4) 각 head별 cls 로짓을 global class 인덱스로 매핑해서 채우기
+        for head_name in head_names:
+            flat, nc_head, box_ch_h = self._normalize_head_output(head_name, head_preds[head_name])
+            assert box_ch_h == box_ch, f"box_ch mismatch: ref={box_ch}, {head_name}={box_ch_h}"
+
+            meta = self.head_meta[head_name]
+            global_ids = meta["global_ids"]  # 길이 = nc_head
+
+            # local cls 채널: flat[..., box_ch : box_ch + nc_head]
+            local_logits = flat[..., box_ch : box_ch + nc_head]  # (B, A, nc_head)
+
+            # global_flat의 해당 위치에 그대로 삽입
+            for local_idx, global_id in enumerate(global_ids):
+                global_flat[..., box_ch + global_id] = local_logits[..., local_idx]
+
+        # 5) 디버그: cls 통계
+        with torch.no_grad():
+            cls_logits = global_flat[..., box_ch:]  # (B, A, num_global)
+            cls_logits_std = float(cls_logits.std())
+            cls_min = float(cls_logits.min())
+            cls_max = float(cls_logits.max())
+            print("[ChimeraPredict DEBUG]  max_conf=", float(cls_logits.sigmoid().max()),
+                "mean_conf=", float(cls_logits.sigmoid().mean()))
+            print("[ChimeraPredict DEBUG2] cls_logits_std=", cls_logits_std,
+                "cls_logits_min=", cls_min, "cls_logits_max=", cls_max)
+
+        with torch.no_grad():
+            boxes_debug = global_flat[0, :5, :4]  # (5, 4)
+            print("\n[GLOBAL FLAT DEBUG] first5 boxes (xywh from ref_head):")
+            print(boxes_debug)
+            print("  nonzero_ratio =", float((boxes_debug.abs() > 1e-3).any(dim=-1).float().mean()))
+
+        return global_flat
+
+
     def init_criterion(self):
-        """Initialize loss criteria for each head if needed."""
-        pass
+        if hasattr(self, "det_criteria") and self.det_criteria:
+            return self.det_criteria
 
+        self._build_head_meta_from_data()
+        head_names = list(self.head_meta.keys())  # 예: ["nonmoving", "rider"]
 
+        sub_heads: list[tuple[str, Detect]] = []
+        chimera_head = self.model[-1]
+
+        for name, module in chimera_head.named_modules():
+            # 자기 자신은 제외
+            if module is chimera_head:
+                continue
+            if isinstance(module, Detect):
+                sub_heads.append((name, module))
+
+        print("[ChimeraDetection][DEBUG] Found Detect sub-heads:", [name for name, _ in sub_heads])
+
+        if len(head_names) != len(sub_heads):
+            raise ValueError(
+                f"multi_heads({len(head_names)}) 와 Detect sub-head 수({len(sub_heads)}) 가 다릅니다.\n"
+                f"multi_heads: {head_names}\n"
+                f"sub_heads: {[name for name, _ in sub_heads]}"
+            )
+
+        self._head_to_detect = {}
+        for head_name, (sub_name, detect_module) in zip(head_names, sub_heads):
+            print(f"[ChimeraDetection][DEBUG] Map head '{head_name}' -> sub-head '{sub_name}'")
+            self._head_to_detect[head_name] = detect_module
+            # 🔥 여기서 stride 직접 복구
+            # 모델 전체 stride를 가져올 수 있으면 그걸 우선 사용
+            model_stride = getattr(self, "stride", None)  # 보통 tensor([8.,16.,32.]) 형태
+
+            for head_name, (sub_name, detect_module) in zip(head_names, sub_heads):
+                if hasattr(detect_module, "stride"):
+                    s = detect_module.stride
+                    # 텐서인 경우
+                    if isinstance(s, torch.Tensor):
+                        if (s == 0).all():
+                            if isinstance(model_stride, torch.Tensor) and model_stride.numel() == s.numel():
+                                detect_module.stride = model_stride.to(s.device)
+                            else:
+                                # fallback: 기본 [8, 16, 32]
+                                nl = getattr(detect_module, "nl", 3)
+                                base = 8.0
+                                vals = [base * (2 ** i) for i in range(nl)]
+                                detect_module.stride = torch.tensor(vals, device=s.device)
+                    # 리스트/튜플인 경우
+                    elif isinstance(s, (list, tuple)):
+                        try:
+                            if all(v == 0 for v in s):
+                                if isinstance(model_stride, torch.Tensor) and model_stride.numel() == len(s):
+                                    detect_module.stride = model_stride.to(next(detect_module.parameters()).device)
+                                else:
+                                    nl = getattr(detect_module, "nl", len(s))
+                                    base = 8.0
+                                    vals = [base * (2 ** i) for i in range(nl)]
+                                    detect_module.stride = torch.tensor(vals, device=next(detect_module.parameters()).device)
+                        except Exception:
+                            pass
+
+            # 디버그: 실제로 고쳐졌는지 다시 찍어보기 (한 번만 찍고 싶으면 flag 써도 됨)
+            for head_name, (sub_name, detect_module) in zip(head_names, sub_heads):
+                print(
+                    f"[ChimeraDetection][DEBUG] (fixed) Detect config for head '{head_name}': "
+                    f"sub_name={sub_name}, nc={getattr(detect_module, 'nc', None)}, "
+                    f"stride={getattr(detect_module, 'stride', None)}, "
+                    f"reg_max={getattr(detect_module, 'reg_max', None)}"
+                )
+        self.det_criteria = {}
+
+        for head_name, (sub_name, detect_module) in zip(head_names, sub_heads):
+            stride = getattr(detect_module, "stride", None)
+            reg_max = getattr(detect_module, "reg_max", None)
+            nc = getattr(detect_module, "nc", None)
+            print(
+                f"[ChimeraDetection][DEBUG] Detect config for head '{head_name}': "
+                f"sub_name={sub_name}, nc={nc}, stride={stride}, reg_max={reg_max}"
+            )
+            proxy = _HeadLossProxy(detect_module, self.args)
+            criterion = v8DetectionLoss(proxy)   # detect.nc/stride/reg_max 로 초기화됨
+            self.det_criteria[head_name] = criterion
+            self._head_to_detect[head_name] = detect_module
+        print("[ChimeraDetection][DEBUG] criterion initialized for heads:", head_names)
+
+        return self.det_criteria
+
+    def _build_head_batch(self, full_batch: dict, head_name: str) -> dict:
+        """
+        full_batch에서 특정 head(nonmoving/rider)용 서브 배치를 만들어
+        v8DetectionLoss에 그대로 넣을 수 있는 형태로 변환.
+
+        full_batch[key] 구조:
+            {
+              "cls": (N_i, 1),
+              "bboxes": (N_i, 4),
+              "batch_idx": (N_i,),
+              ...
+            }
+        """
+        self._build_head_meta_from_data()
+        if head_name not in self.head_meta:
+            raise KeyError(f"Unknown head_name: {head_name}")
+
+        meta = self.head_meta[head_name]
+        global_ids = meta["global_ids"]
+        g2l = meta["g2l"]
+
+        # 원본 batch에서 공통 필드는 그대로 shallow copy
+        head_batch = {k: v for k, v in full_batch.items()
+                      if k not in ("cls", "bboxes", "batch_idx")}
+
+        cls = full_batch["cls"]        # (N, 1)
+        bboxes = full_batch["bboxes"]  # (N, 4)
+        bidx = full_batch["batch_idx"] # (N,)
+
+        if cls.numel() == 0:
+            # 이 batch 자체에 아무 object가 없는 경우
+            head_batch["cls"] = cls.new_zeros((0, 1))
+            head_batch["bboxes"] = bboxes.new_zeros((0, 4))
+            head_batch["batch_idx"] = bidx.new_zeros((0,))
+            return head_batch
+
+        # 1) global class 기준으로 이 head가 관심있는 것만 필터링
+        cls_flat = cls.view(-1).to(torch.long)
+        mask = torch.isin(cls_flat, torch.tensor(global_ids, device=cls.device))
+
+        if not mask.any():
+            # 이 head가 볼 object가 하나도 없는 case
+            head_batch["cls"] = cls.new_zeros((0, 1))
+            head_batch["bboxes"] = bboxes.new_zeros((0, 4))
+            head_batch["batch_idx"] = bidx.new_zeros((0,))
+            return head_batch
+
+        # 2) 필터링된 타겟만 골라냄
+        cls_filtered = cls_flat[mask]
+        bboxes_filtered = bboxes[mask]
+        bidx_filtered = bidx[mask]
+
+        # 3) global id -> head local id로 매핑
+        #    (0~nc_head-1)
+        mapped = [g2l[int(c)] for c in cls_filtered.cpu().tolist()]
+        cls_head = torch.tensor(mapped, device=cls.device, dtype=cls.dtype).view(-1, 1)
+
+        head_batch["cls"] = cls_head
+        head_batch["bboxes"] = bboxes_filtered
+        head_batch["batch_idx"] = bidx_filtered
+        # 🔍 디버그: head별 타깃 통계 (각 head에 대해 한 번만)
+        debug_flag_name = f"_debug_head_batch_{head_name}"
+        if not hasattr(self, debug_flag_name):
+            n = cls_head.shape[0]
+            if n > 0:
+                cls_min = int(cls_head.min().item())
+                cls_max = int(cls_head.max().item())
+                x_min = float(bboxes_filtered[:, 0].min().item())
+                y_min = float(bboxes_filtered[:, 1].min().item())
+                x_max = float(bboxes_filtered[:, 2].max().item())
+                y_max = float(bboxes_filtered[:, 3].max().item())
+            else:
+                cls_min = cls_max = None
+                x_min = y_min = x_max = y_max = None
+
+            print(
+                f"[ChimeraDetection][DEBUG] head_batch('{head_name}'): "
+                f"N={n}, cls_range=[{cls_min}, {cls_max}], "
+                f"bbox_x=[{x_min}, {x_max}], bbox_y=[{y_min}, {y_max}]"
+            )
+            setattr(self, debug_flag_name, True)
+        return head_batch
+
+    def loss(self, batch, preds=None):
+        if not hasattr(self, "det_criteria_initialized"):
+            self.init_criterion()
+            self.det_criteria_initialized = True
+        # 0) head 메타 / criterion 준비
+        self._build_head_meta_from_data()
+
+        img = batch["img"]
+
+        # 1) 항상 멀티헤드 raw prediction을 새로 얻는다.
+        multi_head_out = self._predict_once(img, profile=False, visualize=False, embed=None)
+
+        
+        head_names = list(self.head_meta.keys())  # ["nonmoving", "rider", ...]
+
+        # 2) multi_head_out → head_name -> head_pred 로 정규화
+        if isinstance(multi_head_out, dict):
+            head_preds = multi_head_out
+        elif isinstance(multi_head_out, (list, tuple)):
+            if len(multi_head_out) < len(head_names):
+                raise ValueError(
+                    f"예측된 head 수({len(multi_head_out)})가 multi_heads 정의({len(head_names)})보다 작습니다."
+                )
+            head_preds = {name: p for name, p in zip(head_names, multi_head_out)}
+        else:
+            raise TypeError(f"예상치 못한 multi_head_out 타입: {type(multi_head_out)}")
+
+        device = img.device
+        total_vec = torch.zeros(3, device=device)  # [box, cls, dfl]
+
+        for head_name in head_names:
+            if head_name not in head_preds:
+                continue
+
+            head_pred = head_preds[head_name]               # 이게 [P3, P4, P5] 구조
+            head_batch = self._build_head_batch(batch, head_name)
+            if head_batch is None:
+                continue
+
+            crit = self.det_criteria[head_name]             # v8DetectionLoss(proxy)
+            # v8DetectionLoss는 (loss_vec(3,), loss_items(3,))를 리턴
+            loss_vec, _ = crit(head_pred, head_batch)
+
+            lam = self.lambdas.get(head_name, 1.0)
+            total_vec = total_vec + lam * loss_vec
+
+        total = total_vec.sum()
+        loss_items = total_vec.detach()
+        return total, loss_items
+
+    def postprocess(self, preds):
+        """
+        preds: ChimeraPredict 에서 넘어온 (B, A, 4+53) 텐서라고 가정하고,
+        여기서 NMS + dict 포맷 변환을 전부 직접 수행한다.
+        """
+
+        # H1: 어떤 경로로 들어오는지 1회만 확인
+        if not hasattr(self, "_chimera_post_debug_once"):
+            self._chimera_post_debug_once = True
+            print("\n=== DEBUG H1: postprocess input ===")
+            print("  preds type =", type(preds))
+            if isinstance(preds, torch.Tensor):
+                print("  preds.shape =", preds.shape)
+                B, A, C = preds.shape
+                print("  B, A, C =", B, A, C)
+                print("  first anchor cls logits (first 10):",
+                      preds[0, 0, 4:14].tolist())
+            else:
+                print("  (unexpected preds type)")
+
+        # 이미 list[dict]면, 이 postprocess 경로가 아니라 다른 경로에서 한 번 더 돌고 있다는 뜻
+        if not isinstance(preds, torch.Tensor):
+            print("[WARN] ChimeraDetection.postprocess got non-Tensor, bypassing.")
+            return preds
+
+        # ---------- 1) YOLO 표준 NMS ----------
+        nms_out = ops.non_max_suppression(
+            preds,
+            conf_thres=self.args.conf,
+            iou_thres=self.args.iou,
+            classes=self.args.classes,
+            agnostic=self.args.agnostic_nms,
+            max_det=self.args.max_det,
+        )
+
+        if not hasattr(self, "_chimera_post_nms_once"):
+            self._chimera_post_nms_once = True
+            print("\n=== DEBUG H2: after NMS ===")
+            print("  type(nms_out) =", type(nms_out))
+            if len(nms_out) > 0 and isinstance(nms_out[0], torch.Tensor):
+                print("  nms_out[0].shape =", nms_out[0].shape)
+                if nms_out[0].numel() > 0:
+                    print("  nms_out[0][0] =", nms_out[0][0].tolist())
+
+        # ---------- 2) dict 포맷으로 포장 ----------
+        packed = []
+        nc = len(self.data["names"])  # 53
+
+        for det in nms_out:
+            if not isinstance(det, torch.Tensor) or det.numel() == 0:
+                packed.append(
+                    {
+                        "bboxes": torch.zeros((0, 4), device=self.device),
+                        "conf": torch.zeros((0,), device=self.device),
+                        "cls": torch.zeros((0,), dtype=torch.long, device=self.device),
+                    }
+                )
+                continue
+
+            boxes = det[:, :4]
+            conf = det[:, 4]
+            cls  = det[:, 5].long()
+
+            if not hasattr(self, "_chimera_post_cls_once"):
+                self._chimera_post_cls_once = True
+                print("\n=== DEBUG H3: cls index before clamp ===")
+                print("  cls min/max =", int(cls.min()), int(cls.max()))
+                print("  cls[:10] =", cls[:10].tolist())
+
+            valid = (cls >= 0) & (cls < nc)
+            boxes = boxes[valid]
+            conf  = conf[valid]
+            cls   = cls[valid]
+
+            packed.append({"bboxes": boxes, "conf": conf, "cls": cls})
+
+        if not hasattr(self, "_chimera_post_out_once"):
+            self._chimera_post_out_once = True
+            print("\n=== DEBUG H4: postprocess output ===")
+            print("  type(packed) =", type(packed))
+            if len(packed) > 0:
+                p0 = packed[0]
+                print("  item[0].keys =", p0.keys())
+                c0 = p0["cls"]
+                print("  item[0].cls[:10] =", c0[:10].tolist() if c0.numel() > 0 else [])
+                print("  item[0].cls min/max =",
+                      int(c0.min()) if c0.numel() > 0 else -1,
+                      int(c0.max()) if c0.numel() > 0 else -1)
+
+        return packed
 
 class OBBModel(DetectionModel):
     """YOLO Oriented Bounding Box (OBB) model.
@@ -1869,12 +2253,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, ChimeraDetect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ChimeraDetect}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])

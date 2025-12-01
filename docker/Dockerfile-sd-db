@@ -90,10 +90,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # t=ultralytics/ultralytics:sd-db && sudo docker run -it --ipc=host --gpus all \
 #   -v "$(pwd)"/.env:/ultralytics/.env \
 #   -v "$(pwd)"/data:/ultralytics/data \
-#   -v "$(pwd)"/outputs:/outputs \
+#   -v "$(pwd)"/outputs:/ultralytics/outputs \
 #   -v "$(pwd)"/run:/ultralytics/run \
 #   -v "$(pwd)"/scripts:/ultralytics/scripts \
-#   -v "$(pwd)"/chimera_core:/ultralytics/chimera_core \
 #   -v /mnt/nas:/mnt/nas \
 #   $t
 

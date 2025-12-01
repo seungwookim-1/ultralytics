@@ -1,0 +1,66 @@
+path: /mnt/nas/AI_hub
+train: images/train
+val: images/val
+
+# 멀티헤드용 별도 nc
+nc_nonmoving: 34
+nc_rider: 19
+
+names_nonmoving:
+    0: Column
+    1: Horizontal member
+    2: Guidepost
+    3: Seagull sign
+    4: Signpost
+    5: Obstacle target sign
+    6: Structure paint & Hatching sign
+    7: Guide post
+    8: Lighting facility
+    9: Road reflector
+    10: Speed bump
+    11: Median barrier
+    12: Guardrail
+    13: Impact absorbing facility
+    14: Rockfall net
+    15: Rockfall barrier
+    16: Rockfall prevention wall
+    17: Vegetation method
+    18: Bridge
+    19: Tunnel
+    20: Underpass
+    21: Overpass
+    22: Interchange
+    23: Underground passage
+    24: Footbridge
+    25: Station
+    26: Traffic signal
+    27: Road sign
+    28: Safety sign
+    29: Road name sign
+    30: Emergency contact facility
+    31: CCTV
+    32: Road electronic sign
+    33: Road mileage sign
+
+names_rider:
+    0: ambulance
+    1: bicycle
+    2: bus
+    3: constructionGuide
+    4: motorcycle
+    5: otherCar
+    6: pedestrian
+    7: policeCar
+    8: rider
+    9: rubberCone
+    10: safetyZone
+    11: schoolBus
+    12: trafficDrum
+    13: trafficLight
+    14: trafficSign
+    15: truck
+    16: twoWheeler
+    17: vehicle
+    18: warningTriangle
+
+channels: 3

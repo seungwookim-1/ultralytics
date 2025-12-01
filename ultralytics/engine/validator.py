@@ -220,6 +220,31 @@ class BaseValidator:
             with dt[3]:
                 preds = self.postprocess(preds)
 
+                if not hasattr(self, "_chimera_val_debug_once"):
+                    self._chimera_val_debug_once = True
+                    print("\n=== DEBUG I: before update_metrics ===")
+                    print("type(preds) =", type(preds))
+                    names = self.data.get("names", {})
+
+                    if isinstance(preds, (list, tuple)):
+                        for i, p in enumerate(preds):
+                            print(f"  image {i}: type =", type(p))
+                            if isinstance(p, dict) and isinstance(p.get("cls", None), torch.Tensor):
+                                cls = p["cls"]
+                                print("    num_det =", int(cls.numel()))
+                                if cls.numel() > 0:
+                                    cls_min = int(cls.min().item())
+                                    cls_max = int(cls.max().item())
+                                    print("    cls min/max =", cls_min, cls_max)
+                                    first = cls[:10].tolist()
+                                    print("    first 10 cls =", first)
+                                    print("    first 10 names =",
+                                        [names.get(int(c), "<OUT_OF_RANGE>") for c in first])
+                            elif isinstance(p, torch.Tensor):
+                                print("    tensor preds.shape =", tuple(p.shape))
+                    else:
+                        print("  preds not list/tuple; type =", type(preds))
+            print("[DEBUG WHOAMI] validator postprocess =", self.postprocess.__qualname__)
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3 and RANK in {-1, 0}:
                 self.plot_val_samples(batch, batch_i)
