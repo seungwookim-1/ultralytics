@@ -302,6 +302,47 @@ class v8DetectionLoss:
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
 
+class MoEDetectionLoss(v8DetectionLoss):
+    """Criterion class for computing training losses for MoE detection models.
+
+    Extends v8DetectionLoss to include auxiliary load balancing loss for
+    mixture-of-experts routing.
+    """
+
+    def __init__(self, model):
+        """Initialize MoE detection loss with load balancing.
+
+        Args:
+            model: The detection model instance.
+        """
+        super().__init__(model)
+        self.aux_loss_weight = getattr(model.args, "moe_aux_loss", 0.01)
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate total loss including detection loss and MoE auxiliary loss.
+
+        Args:
+            preds: Tuple of (predictions, aux_loss) if training with MoE, or just predictions.
+            batch: Batch dictionary with images and labels.
+
+        Returns:
+            (tuple): Total loss and loss items tensor.
+        """
+        if isinstance(preds, tuple) and len(preds) == 2:
+            predictions, aux_loss = preds
+        else:
+            predictions = preds
+            aux_loss = torch.tensor(0.0, device=self.device)
+
+        detection_loss, loss_items = super().__call__(predictions, batch)
+
+        total_loss = detection_loss + aux_loss
+
+        loss_items_with_aux = torch.cat([loss_items, aux_loss.detach().unsqueeze(0)])
+
+        return total_loss, loss_items_with_aux
+
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 

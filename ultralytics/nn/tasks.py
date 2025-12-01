@@ -54,6 +54,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    MoEDetect,
     Pose,
     RepC3,
     RepConv,
@@ -73,6 +74,7 @@ from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2EDetectLoss,
+    MoEDetectionLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -481,7 +483,12 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        if getattr(self, "end2end", False):
+            return E2EDetectLoss(self)
+        elif isinstance(self.model[-1], MoEDetect):
+            return MoEDetectionLoss(self)
+        else:
+            return v8DetectionLoss(self)
 
 
 class OBBModel(DetectionModel):
@@ -1624,12 +1631,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, MoEDetect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, MoEDetect}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])

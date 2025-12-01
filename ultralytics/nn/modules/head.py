@@ -20,7 +20,18 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+    "MoEDetect",
+)
 
 
 class Detect(nn.Module):
@@ -1180,3 +1191,227 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
+
+
+class RouterNetwork(nn.Module):
+    """Router network for MoE soft routing.
+
+    Computes soft routing weights for mixture-of-experts architecture. Uses global
+    average pooling to extract features, then MLP to compute routing logits.
+
+    Attributes:
+        gap (nn.AdaptiveAvgPool2d): Global average pooling layer.
+        mlp (nn.Sequential): Multi-layer perceptron for routing decision.
+        temperature (nn.Parameter): Temperature parameter for softmax sharpness.
+    """
+
+    def __init__(self, in_channels: int, num_experts: int = 4, hidden_dim: int = 256):
+        """Initialize RouterNetwork with input channels and number of experts.
+
+        Args:
+            in_channels (int): Number of input channels.
+            num_experts (int): Number of experts to route to.
+            hidden_dim (int): Hidden dimension for MLP.
+        """
+        super().__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, num_experts),
+        )
+        self.temperature = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute routing weights via global pooling and MLP.
+
+        Args:
+            x (torch.Tensor): Input feature map [B, C, H, W].
+
+        Returns:
+            (tuple): Routing weights [B, num_experts] and logits [B, num_experts].
+        """
+        context = self.gap(x).flatten(1)
+        logits = self.mlp(context)
+        weights = F.softmax(logits / self.temperature, dim=1)
+        return weights, logits
+
+
+class ExpertHead(nn.Module):
+    """Lightweight expert detection head for MoE architecture.
+
+    Single expert specializing in a particular detection aspect. Lighter than
+    full detection head for efficiency.
+
+    Attributes:
+        cv2 (nn.Sequential): Box regression branch.
+        cv3 (nn.Sequential): Classification branch with DW-separable convs.
+    """
+
+    def __init__(self, in_channels: int, nc: int, reg_max: int = 16):
+        """Initialize ExpertHead with input channels and number of classes.
+
+        Args:
+            in_channels (int): Number of input channels.
+            nc (int): Number of classes.
+            reg_max (int): DFL channels for box regression.
+        """
+        super().__init__()
+        c2 = max(16, in_channels // 4, reg_max * 4)
+        c3 = max(in_channels, min(nc, 100))
+
+        self.cv2 = nn.Sequential(
+            Conv(in_channels, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1)
+        )
+        self.cv3 = nn.Sequential(
+            DWConv(in_channels, in_channels, 3),
+            Conv(in_channels, c3, 1),
+            DWConv(c3, c3, 3),
+            Conv(c3, c3, 1),
+            nn.Conv2d(c3, nc, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass through expert head.
+
+        Args:
+            x (torch.Tensor): Input feature map [B, C, H, W].
+
+        Returns:
+            (tuple): Box predictions [B, 4*reg_max, H, W] and class predictions [B, nc, H, W].
+        """
+        return self.cv2(x), self.cv3(x)
+
+
+class MoEDetect(Detect):
+    """Mixture-of-Experts YOLO detection head with soft routing.
+
+    Extends the standard YOLO Detect head with multiple expert heads and a router
+    network for each scale. Uses soft routing to combine expert predictions.
+
+    Attributes:
+        num_experts (int): Number of expert heads per scale.
+        routers (nn.ModuleList): Router networks for each scale.
+        experts (nn.ModuleList): Expert heads for each scale and expert index.
+        expert_counts (torch.Tensor): Tracks expert usage statistics.
+        aux_loss_weight (float): Weight for auxiliary load balancing loss.
+    """
+
+    def __init__(self, nc: int = 80, ch: tuple = (), num_experts: int = 4):
+        """Initialize MoEDetect with number of classes, channels, and experts.
+
+        Args:
+            nc (int): Number of classes.
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+            num_experts (int): Number of expert heads per scale.
+        """
+        super().__init__(nc, ch)
+
+        del self.cv2
+        del self.cv3
+
+        self.num_experts = num_experts
+        self.routers = nn.ModuleList([RouterNetwork(x, num_experts) for x in ch])
+        self.experts = nn.ModuleList(
+            [nn.ModuleList([ExpertHead(x, nc, self.reg_max) for _ in range(num_experts)]) for x in ch]
+        )
+
+        self.register_buffer("expert_counts", torch.zeros(num_experts))
+        self.aux_loss_weight = 0.01
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor] | tuple:
+        """Forward pass with mixture-of-experts routing.
+
+        Args:
+            x (list): List of feature maps [P3, P4, P5], each [B, C_i, H_i, W_i].
+
+        Returns:
+            If training: (list of predictions, auxiliary loss)
+            If inference: standard detection output.
+        """
+        outputs = []
+        router_info = []
+
+        for i in range(self.nl):
+            routing_weights, routing_logits = self.routers[i](x[i])
+            router_info.append((routing_weights, routing_logits))
+
+            expert_boxes = []
+            expert_cls = []
+            for expert in self.experts[i]:
+                box_pred, cls_pred = expert(x[i])
+                expert_boxes.append(box_pred)
+                expert_cls.append(cls_pred)
+
+            expert_boxes = torch.stack(expert_boxes, dim=0)
+            expert_cls = torch.stack(expert_cls, dim=0)
+
+            weights = routing_weights.T.view(self.num_experts, -1, 1, 1, 1)
+            box_out = (expert_boxes * weights).sum(dim=0)
+            cls_out = (expert_cls * weights).sum(dim=0)
+
+            outputs.append(torch.cat((box_out, cls_out), 1))
+
+            if self.training:
+                with torch.no_grad():
+                    self.expert_counts += routing_weights.sum(dim=0)
+
+        if self.training:
+            aux_loss = self._compute_load_balance_loss(router_info)
+            return outputs, aux_loss
+
+        y = self._inference(outputs)
+        return y if self.export else (y, outputs)
+
+    def _compute_load_balance_loss(self, router_info: list) -> torch.Tensor:
+        """Compute auxiliary load balancing loss.
+
+        Uses entropy regularization and coefficient of variation to encourage
+        balanced expert usage and diverse routing.
+
+        Args:
+            router_info (list): List of (routing_weights, routing_logits) tuples.
+
+        Returns:
+            (torch.Tensor): Auxiliary load balancing loss.
+        """
+        total_entropy_loss = 0
+        total_cv_loss = 0
+
+        for routing_weights, _ in router_info:
+            entropy = -torch.sum(routing_weights * torch.log(routing_weights + 1e-10), dim=1).mean()
+            total_entropy_loss += -entropy
+
+            mean_usage = routing_weights.mean(dim=0)
+            std_usage = routing_weights.std(dim=0)
+            cv = (std_usage / (mean_usage + 1e-10)).mean()
+            total_cv_loss += cv
+
+        aux_loss = (total_entropy_loss + total_cv_loss) / self.nl
+        return aux_loss * self.aux_loss_weight
+
+    def bias_init(self):
+        """Initialize detection head biases with expert specialization.
+
+        Different biases encourage experts to specialize in different domains:
+        - Expert 1: Small objects
+        - Expert 2: Balanced
+        - Expert 3: Large objects
+        - Expert 4: Dense scenes
+        """
+        specializations = [
+            (0.5, 1.0),
+            (1.0, 1.0),
+            (1.5, 0.8),
+            (1.0, 1.2),
+        ]
+
+        for scale_experts in self.experts:
+            for expert_idx, expert in enumerate(scale_experts):
+                size_bias, conf_bias = specializations[expert_idx]
+
+                expert.cv2[-1].bias.data[:] = size_bias
+
+                for s in self.stride:
+                    expert.cv3[-1].bias.data[:] = math.log(5 * conf_bias / self.nc / (640 / s) ** 2)
