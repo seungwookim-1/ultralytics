@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-
+from logging import Logger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -303,45 +303,93 @@ class v8DetectionLoss:
 
 
 class MoEDetectionLoss(v8DetectionLoss):
-    """Criterion class for computing training losses for MoE detection models.
-
-    Extends v8DetectionLoss to include auxiliary load balancing loss for
-    mixture-of-experts routing.
-    """
-
-    def __init__(self, model):
-        """Initialize MoE detection loss with load balancing.
-
-        Args:
-            model: The detection model instance.
-        """        
+    def __init__(self, model, teacher_model=None):
         super().__init__(model)
-        self.model = model
+        self.model  = model
+        self.teacher = teacher_model
         self.aux_loss_weight = getattr(model.args, "moe_aux_loss", 0.01)
+        self.kd_weight       = getattr(model.args, "moe_kd_weight", 1.0)
+        self.kd_temp         = getattr(model.args, "moe_kd_temp", 1.0)
 
+        print("[MoEDetectionLoss.__init__] teacher is None? :", self.teacher is None)
 
-    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate total loss including detection loss and MoE auxiliary loss.
+    def __call__(self, preds, batch):
+        # v8DetectionLoss: loss_vec (box, cls, dfl), loss_items (detach된 동일 벡터)
+        det_vec, loss_items = super().__call__(preds, batch)   # det_vec: (3,) 텐서
 
-        Args:
-            preds: Tuple of (predictions, aux_loss) if training with MoE, or just predictions.
-            batch: Batch dictionary with images and labels.
+        # backward 용 scalar loss
+        det_loss = det_vec.sum()   # 스칼라 텐서
 
-        Returns:
-            (tuple): Total loss and loss items tensor.
-        """
-        
-        detection_loss, loss_items = super().__call__(preds, batch)
         head = self.model.model[-1]
-        aux_loss = getattr(head, "moe_aux_loss", 0.01)
+        aux_loss = getattr(head, "moe_aux_loss", None)
 
-        if (not self.model.training) or (aux_loss is None):
-            return detection_loss, loss_items
+        total_loss = det_loss
 
-        total_loss = detection_loss + self.aux_loss_weight * aux_loss
+        # 1) MoE aux loss
+        if self.model.training and aux_loss is not None:
+            total_loss = total_loss + self.aux_loss_weight * aux_loss
 
-        # loss_items_with_aux = torch.cat([loss_items, aux_loss.detach().unsqueeze(0)])
+        # 2) KD loss
+        kd_loss = None
+        kd_mode = None
 
+        if self.model.training and self.teacher is not None and self.kd_weight > 0:
+            # --- teacher forward ---
+            with torch.no_grad():
+                t_out = self.teacher(batch["img"])
+                # v8DetectionLoss에서 preds가 (preds, feats) or feats 형태인 걸 따라감
+                t_preds = t_out[0] if isinstance(t_out, (list, tuple)) else t_out  # (B, N_t, no)
+
+            # --- student preds ---
+            s_preds = preds[0] if isinstance(preds, (list, tuple)) else preds      # (B, N_s, no)
+
+            # 앞 4는 box, 그 뒤가 cls 로짓 (reg_max>1이면 여기 조정해도 됨)
+            t_logits = t_preds[..., 4:]   # (B, N_t, C)
+            s_logits = s_preds[..., 4:]   # (B, N_s, C)
+
+            # 클래스 개수는 동일해야 함
+            if t_logits.shape[-1] != s_logits.shape[-1]:
+                raise RuntimeError(
+                    f"[MoE KD] #classes mismatch: teacher={t_logits.shape[-1]}, "
+                    f"student={s_logits.shape[-1]}"
+                )
+
+            T = self.kd_temp
+
+            # --- case 1: shape 완전 동일 → anchor-wise KD ---
+            if t_logits.shape == s_logits.shape:
+                # (B, N, C)
+                t_prob     = torch.softmax(t_logits / T, dim=-1)
+                s_log_prob = torch.log_softmax(s_logits / T, dim=-1)
+                kd_mode = "anchor-wise"
+
+            # --- case 2: N_t != N_s → image-wise KD (anchor dimension pooling) ---
+            else:
+                # (B, N_t, C) / (B, N_s, C) → (B, C)
+                t_logits_pooled = t_logits.mean(dim=1)
+                s_logits_pooled = s_logits.mean(dim=1)
+
+                t_prob     = torch.softmax(t_logits_pooled / T, dim=-1)      # (B, C)
+                s_log_prob = torch.log_softmax(s_logits_pooled / T, dim=-1)  # (B, C)
+                kd_mode = "image-wise"
+
+            # 공통 KL 계산
+            kd_loss = torch.sum(
+                t_prob * (torch.log(t_prob + 1e-8) - s_log_prob),
+                dim=-1,
+            ).mean()
+            kd_loss = (T * T) * kd_loss
+
+            total_loss = total_loss + self.kd_weight * kd_loss
+
+            # print(
+            #     f"[MoE KD] mode={kd_mode}, "
+            #     f"det={float(det_loss):.4f}, "
+            #     f"kd={float(kd_loss):.4f}, "
+            #     f"aux={float(aux_loss) if aux_loss is not None else 0.0:.4f}"
+            # )
+
+        # trainer 쪽 인터페이스: (스칼라 total_loss, 벡터 loss_items)
         return total_loss, loss_items
 
 

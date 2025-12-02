@@ -1223,6 +1223,9 @@ class RouterNetwork(nn.Module):
         )
         self.temperature = nn.Parameter(torch.ones(1))
 
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing weights via global pooling and MLP.
 
@@ -1321,6 +1324,8 @@ class MoEDetect(Detect):
         self.aux_loss_weight = 0.01
         self.moe_aux_loss: torch.Tensor | None = None
 
+        self._initialized_from_detect = False
+
     def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor] | tuple:
         """Forward pass with mixture-of-experts routing.
 
@@ -1385,31 +1390,76 @@ class MoEDetect(Detect):
 
 
     def _compute_load_balance_loss(self, router_info: list) -> torch.Tensor:
-        """Compute auxiliary load balancing loss.
-
-        Uses entropy regularization and coefficient of variation to encourage
-        balanced expert usage and diverse routing.
-
-        Args:
-            router_info (list): List of (routing_weights, routing_logits) tuples.
-
-        Returns:
-            (torch.Tensor): Auxiliary load balancing loss.
         """
-        total_entropy_loss = 0
-        total_cv_loss = 0
+        router_info: [(routing_weights, routing_logits), ...]
+        routing_weights: (B * H * W, E)
+        """
+        total_entropy = 0.0
+        total_balance = 0.0
 
         for routing_weights, _ in router_info:
+            # 1) per-position entropy (높을수록 분포가 균등함)
             entropy = -torch.sum(routing_weights * torch.log(routing_weights + 1e-10), dim=1).mean()
-            total_entropy_loss += -entropy
+            # 우리는 "entropy를 낮추고" 싶으니, loss에 +entropy로 넣는다.
+            total_entropy += entropy
 
-            mean_usage = routing_weights.mean(dim=0)
-            std_usage = routing_weights.std(dim=0)
-            cv = (std_usage / (mean_usage + 1e-10)).mean()
-            total_cv_loss += cv
+            # 2) expert별 평균 사용량이 uniform에 가까워지도록
+            mean_usage = routing_weights.mean(dim=0)             # (E,)
+            mean_usage = mean_usage / (mean_usage.sum() + 1e-10) # 확률화
 
-        aux_loss = (total_entropy_loss + total_cv_loss) / self.nl
-        return aux_loss * self.aux_loss_weight
+            # target은 균등 분포 1/E
+            E = routing_weights.shape[1]
+            uniform = routing_weights.new_full((E,), 1.0 / E)
+
+            balance = ((mean_usage - uniform) ** 2).mean()
+            total_balance += balance
+
+        # 가중치 비율은 hyper로 조정 (예시)
+        lambda_entropy = 0.1   # sparsity (낮을수록 one-hot에 가까움)
+        lambda_balance = 1.0   # 전체 expert-load 균등
+
+        aux_loss = (lambda_entropy * total_entropy + lambda_balance * total_balance) / self.nl
+
+        return aux_loss
+
+
+    @torch.no_grad()
+    def init_from_detect(self, detect_head: Detect, noise_scale: float = 0.01):
+        """
+        Pretrained YOLO Detect head에서 MoE expert 들로 '완전히' 가중치를 복사.
+
+        각 scale i에 대해:
+        - detect_head.cv2[i], cv3[i] 전체 Sequential 블록을
+        - 모든 expert의 cv2, cv3 에 deep copy로 넣는다.
+        그러면 초기 MoE는 baseline Detect head를 그대로 복제한 꼴이 된다.
+        """
+        assert isinstance(detect_head, Detect)
+        assert detect_head.nl == self.nl
+
+        # 기본 속성 동기화
+        self.stride = detect_head.stride.clone()
+        self.nc = detect_head.nc
+        self.reg_max = detect_head.reg_max
+        self.no = detect_head.no
+        
+
+        for i in range(self.nl):
+            base_reg_block = detect_head.cv2[i]  # nn.Sequential 또는 Conv
+            base_cls_block = detect_head.cv3[i]
+
+
+            for e_idx, expert in enumerate(self.experts[i]):
+                # 1) 일단 모두 base head 근처에서 시작
+                expert.cv2 = copy.deepcopy(base_reg_block)
+                expert.cv3 = copy.deepcopy(base_cls_block)
+
+                # 2) 0번 expert는 거의 teacher 그대로, 나머지는 "살짝 비틀기"
+                if e_idx > 0 and noise_scale > 0:
+                    for p in expert.parameters():
+                        # teacher 주변의 작은 노이즈 → warm-start 유지 + 대칭만 깨기
+                        p.add_(noise_scale * torch.randn_like(p))
+        # 이후 bias_init에서 덮어쓰지 않도록 플래그
+        self._initialized_from_detect = True
 
     def bias_init(self):
         """Initialize detection head biases with expert specialization.
@@ -1420,6 +1470,9 @@ class MoEDetect(Detect):
         - Expert 3: Large objects
         - Expert 4: Dense scenes
         """
+        if getattr(self, "_initialized_from_detect", False):
+            return
+
         specializations = [
             (0.5, 1.0),
             (1.0, 1.0),

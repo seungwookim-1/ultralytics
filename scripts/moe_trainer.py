@@ -1,25 +1,34 @@
 from ultralytics import YOLO
-from symlink_path import create_dataset_config
+from ultralytics.models.yolo.detect import DetectionTrainer
+from ultralytics.utils import DEFAULT_CFG
 
-base = YOLO('yolo11n.pt')
-# Load MoE model
-moe = YOLO('yolo11-moe.yaml')
-moe.model.load_state_dict(base.model.state_dict(), strict=False)
 
-dataset_config_path = create_dataset_config(val_ratio=0.1, seed=42, max_train=1000, max_val=100)
-# Train with MoE-specific settings
+class MoETrainer(DetectionTrainer):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+        self.teacher_model = None
+        super().__init__(cfg, overrides, _callbacks)
 
-for k in ['scales', 'num_experts', 'backbone', 'head', 'nc', 'moe_aux_loss']:
-    moe.overrides.pop(k, None)
 
-results = moe.train(
-    data= str(dataset_config_path),
-    epochs=50,
-)
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        from ultralytics.nn.tasks import DetectionModel
+        if weights is not None:
+            print("[MoETrainer] get_model: reuse provided weights")
+            model = weights
+        else:
+            print("[MoETrainer] get_model: build new model from cfg (fallback)")
+            model = DetectionModel(cfg, verbose=verbose)
+        
+        if self.teacher_model is None:
+            teacher_ckpt = "/ultralytics/data/teacher_v0/best.pt"
+            y = YOLO(teacher_ckpt)
+            t_model = y.model
+            for p in t_model.parameters():
+                p.requires_grad = False
+            t_model.eval()
+            self.teacher_model = t_model
+            print("[MoETrainer] teacher loaded:", teacher_ckpt)
 
-# Inference (same as standard YOLO)
-# results = moe('image.jpg')
+            model.teacher_model = self.teacher_model
+            print("[MoETrainer] teacher attached to model")
 
-# Analyze expert specialization
-expert_usage = moe.model.model[-1].expert_counts
-print(f"Expert usage: {expert_usage}")
+        return model

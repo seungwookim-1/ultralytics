@@ -389,6 +389,7 @@ class DetectionModel(BaseModel):
         self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
+        self.criterion = None
 
         # Build strides
         m = self.model[-1]  # Detect()
@@ -489,6 +490,20 @@ class DetectionModel(BaseModel):
             return MoEDetectionLoss(self)
         else:
             return v8DetectionLoss(self)
+    
+
+    def loss(self, batch, preds=None):
+        if getattr(self, "criterion", None) is None:
+            head = self.model[-1]
+            if isinstance(head, MoEDetect):
+                # MoE 모델이면 MoEDetectionLoss 사용
+                teacher = getattr(self, "teacher_model", None)  # Trainer가 달아준 것
+                self.criterion = MoEDetectionLoss(self, teacher_model=teacher)
+            else:
+                self.criterion = v8DetectionLoss(self)
+        if preds is None:
+            preds = self.forward(batch["img"])
+        return self.criterion(preds, batch)
 
 
 class OBBModel(DetectionModel):
