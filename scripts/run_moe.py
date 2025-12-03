@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 from ultralytics.nn.modules.head import MoEDetect
-from symlink_helper import create_dataset_config
-from moe_trainer import MoETrainer
+from custom_core.symlink_helper import create_dataset_config
+from custom_core.moe_trainer import MoETrainer
 
 
 # 1) dataset 고정

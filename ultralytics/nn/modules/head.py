@@ -1376,10 +1376,6 @@ class MoEDetect(Detect):
         # 3) training : return aux_loss
         if self.training:
             aux_loss = self._compute_load_balance_loss(router_info)
-            # with torch.no_grad():
-            #     # (optional)expert_counts update
-            #     for routing_weights, _ in router_info:
-            #         self.expert_counts += routing_weights.sum(dim=0)
             self.moe_aux_loss = aux_loss
             return outputs
 
@@ -1400,7 +1396,6 @@ class MoEDetect(Detect):
         for routing_weights, _ in router_info:
             # 1) per-position entropy (높을수록 분포가 균등함)
             entropy = -torch.sum(routing_weights * torch.log(routing_weights + 1e-10), dim=1).mean()
-            # 우리는 "entropy를 낮추고" 싶으니, loss에 +entropy로 넣는다.
             total_entropy += entropy
 
             # 2) expert별 평균 사용량이 uniform에 가까워지도록

@@ -146,6 +146,7 @@ runs/
 wandb/
 .DS_Store
 run/
+scripts/temp/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/
