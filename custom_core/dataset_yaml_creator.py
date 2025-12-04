@@ -1,17 +1,17 @@
 from pathlib import Path
 from dataclasses import dataclass
-from auto_symlink_helper import LabelConfig
+from .dataclass.domain_config import DomainConfig
 
 @dataclass
 class LocalClasses:
-    label_name: str
+    domain_name: str
     local_names: list[str]
     @property
     def nc(self) -> int:
         return len(self.local_names)
 
 
-def _build_local_label_class(cfg: LabelConfig):
+def _build_local_domain_class(cfg: DomainConfig):
     local_names = []
     for line in cfg.class_list_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -34,20 +34,20 @@ def _build_local_label_class(cfg: LabelConfig):
 
         local_names.append(name)
 
-    return LocalClasses(label_name = cfg.name, local_names = local_names)
+    return LocalClasses(domain_name = cfg.name, local_names = local_names)
 
 
-def _build_local_structs(label_configs: list[LabelConfig]) -> list[LocalClasses]:
+def _build_local_structs(domain_configs: list[DomainConfig]) -> list[LocalClasses]:
     local_structs_list = []
-    for cfg in label_configs:
-        local_structs_list.append(_build_local_label_class(cfg))
+    for cfg in domain_configs:
+        local_structs_list.append(_build_local_domain_class(cfg))
     return local_structs_list
 
-def data_yaml_writer(VIRTUAL_ROOT: Path, LABEL_CONFIGS: list[LabelConfig]):
+def write_dataset_yaml(VIRTUAL_ROOT: Path, DOMAIN_CONFIGS: list[DomainConfig]):
     
     DATASET_YAML = VIRTUAL_ROOT / "multihead_data.yaml"
 
-    local_structs_list = _build_local_structs(LABEL_CONFIGS)
+    local_structs_list = _build_local_structs(DOMAIN_CONFIGS)
     nc_sum = sum(ls.nc for ls in local_structs_list)
 
     _content: list[str] = []
@@ -65,10 +65,10 @@ def data_yaml_writer(VIRTUAL_ROOT: Path, LABEL_CONFIGS: list[LabelConfig]):
             _idx += 1
     
     for local_struct in local_structs_list:
-        _content.append(f"nc_{local_struct.label_name}: {local_struct.nc}")
+        _content.append(f"nc_{local_struct.domain_name}: {local_struct.nc}")
     
     for local_struct in local_structs_list:
-        _content.append(f"names_{local_struct.label_name}:")
+        _content.append(f"names_{local_struct.domain_name}:")
         for i, name in enumerate(local_struct.local_names):
             _content.append(f"    {i}: {name}")
 

@@ -15,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     MKL_THREADING_LAYER=GNU \
-    OMP_NUM_THREADS=1 
+    OMP_NUM_THREADS=1
+
+ENV PYTHONPATH=/ultralytics
 
 # Downloads to user config dir
 ADD https://github.com/ultralytics/assets/releases/download/v0.0.0/Arial.ttf \
@@ -62,8 +64,8 @@ RUN uv pip install --system -e ".[export]" "albumentations>=1.4.6" comet pycocot
 
 # Run exports to AutoInstall packages
 # Edge TPU export fails the first time so is run twice here
-RUN yolo export model=tmp/yolo11n.pt format=edgetpu imgsz=32 || yolo export model=tmp/yolo11n.pt format=edgetpu imgsz=32
-RUN yolo export model=tmp/yolo11n.pt format=ncnn imgsz=32
+# RUN yolo export model=tmp/yolo11n.pt format=edgetpu imgsz=32 || yolo export model=tmp/yolo11n.pt format=edgetpu imgsz=32
+# RUN yolo export model=tmp/yolo11n.pt format=ncnn imgsz=32
 # Requires <= Python 3.10, bug with paddlepaddle==2.5.0 https://github.com/PaddlePaddle/X2Paddle/issues/991
 RUN uv pip install --system "paddlepaddle>=2.6.0" x2paddle
 
@@ -93,7 +95,8 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 #   -v "$(pwd)"/outputs:/outputs \
 #   -v "$(pwd)"/run:/ultralytics/run \
 #   -v "$(pwd)"/scripts:/ultralytics/scripts \
-#   -v "$(pwd)"/chimera_core:/ultralytics/chimera_core \
+#   -v "$(pwd)"/custom_core:/ultralytics/custom_core \
+#   -v "$(pwd)"/ultralytics:/ultralytics/ultralytics \
 #   -v /mnt/nas:/mnt/nas \
 #   $t
 

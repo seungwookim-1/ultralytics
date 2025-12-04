@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 from ultralytics.nn.modules.head import MoEDetect
-from symlink_helper import create_dataset_config
-from moe_trainer import MoETrainer
+from custom_core.symlink_helper import create_dataset_config
+from custom_core.moe_trainer import MoETrainer
 
 # 1) dataset 고정
 dataset_config_path = create_dataset_config(
@@ -24,25 +24,25 @@ moe_head.init_from_detect(base_head, noise_scale=0.01)
 moe.ckpt = True
 
 # 5) 공통 하이퍼
-common_hp = dict(
+common_config = dict(
+    data=str(dataset_config_path),
     epochs=50,
     batch=16,
     imgsz=640,
     seed=42,
 )
 
-# 7) MoE 학습
+# 6) MoE 학습
 results_moe = moe.train(
-    data=str(dataset_config_path),
     trainer = MoETrainer,
     # teacher_ckpt="/ultralytics/data/teacher_v0/best.pt",
-    **common_hp,
+    **common_config,
 )
+print("Expert usage:", moe_head.expert_counts)
 
-# 6) baseline 학습
+# 7) 비교군 (baseline) 학습
 results_base = base.train(
-    data=str(dataset_config_path),
-    **common_hp,
+    **common_config,
 )
 
 print("Expert usage:", moe_head.expert_counts)
