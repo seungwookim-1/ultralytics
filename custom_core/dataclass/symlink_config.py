@@ -10,5 +10,6 @@ class SymlinkConfig:
     images_val: Path
     labels_train: Path
     labels_val: Path
+    dataset_yaml: Path
     domain_configs: List[DomainConfig]
     

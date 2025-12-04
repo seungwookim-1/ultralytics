@@ -1,85 +1,83 @@
 from pathlib import Path
 import random
-from .config_loader import get_symlink_config
+from custom_core.dataclass.symlink_config import SymlinkConfig
+from .data_pair_collector import collect_image_label_pairs
+from .data_balancer import select_balanced_stems
 
 
-def select_balanced_stems(
-    all_stems: list[str],
-    domain_image_maps: dict[str, dict[str, Path]],
-    target: int,
-    rng: random.Random,
-) -> list[str]:
-    """
-    도메인 개수에 상관없이, 각 도메인에 비슷한 수의 샘플이 배분되도록 stem을 뽑는다.
-    - target: 최종적으로 원하는 stem 개수
-    - domain_image_maps: domain_name -> {stem -> image_path}
-    """
-    if target is None or target >= len(all_stems):
-        # 전체 쓰는 게 목표보다 적으면 그냥 다 쓰기
-        return list(all_stems)
+def build_maps_and_splits(
+    sym_cfg: SymlinkConfig,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+    max_train: int | None = None,
+    max_val: int | None = None
+    ):
 
-    sym_cfg = get_symlink_config()
-    domain_names = [cfg.name for cfg in sym_cfg.domain_configs]
+    rng = random.Random(seed)
+    # 0) 이번에 실제로 필요한 페어 개수 계산
+    total_needed = 0
+    if max_train:
+        total_needed += max_train
+    if max_val:
+        total_needed += max_val
+    if total_needed == 0:
+        total_needed = 1100  # 디폴트 디버그용
 
-    # stem 별로 어떤 도메인에 속하는지 membership 계산
-    membership: dict[str, list[str]] = {}
-    for stem in all_stems:
-        doms = [d for d in domain_names if stem in domain_image_maps.get(d, {})]
-        membership[stem] = doms
+    # 여유 버퍼 (조금 더 많이 확보해두고 그 안에서 train/val 나눔)
+    buffered = int(total_needed * 1.5)
 
-    # 단일 도메인 전용 stem 풀(single) + 다중 도메인 공유 stem 풀(multi)
-    single_pools: dict[str, list[str]] = {d: [] for d in domain_names}
-    multi_pool: list[str] = []
+    # 1) 라벨 기반으로 페어 샘플링
+    domain_image_maps : dict[str, dict[str, Path]] = {}
+    domain_label_maps : dict[str, dict[str, Path]] = {}
 
-    for stem, doms in membership.items():
-        if len(doms) == 1:
-            single_pools[doms[0]].append(stem)
-        elif len(doms) > 1:
-            multi_pool.append(stem)
-        # 0개인 stem은 애초에 all_stems에 안 들어왔다고 가정
+    for cfg in sym_cfg.domain_configs:
+        image_dir = cfg.root / "images"
+        label_dir = cfg.root / "labels"
 
-    for d in domain_names:
-        rng.shuffle(single_pools[d])
-    rng.shuffle(multi_pool)
+        domain_target = buffered
+        if cfg.max_images is not None:
+            domain_target = min(buffered, cfg.max_images)
+        
+        image_map, label_map = collect_image_label_pairs(
+            image_dir,
+            label_dir,
+            target_pairs = domain_target,
+            rng = rng,
+            max_scan_labels=20000)
+        domain_image_maps[cfg.name] = image_map
+        domain_label_maps[cfg.name] = label_map
 
-    selected: list[str] = []
-    selected_set: set[str] = set()
-    domain_counts: dict[str, int] = {d: 0 for d in domain_names}
+    # 2) 완전히 비었다면 에러
+    if all(not map for map in domain_image_maps.values()):
+        raise RuntimeError("어떠한 domain에서도 이미지-라벨 페어를 찾지 못했습니다.")
 
-    # 도메인별로 맞추고 싶은 대략 목표치
-    target_per_domain = max(1, target // len(domain_names))
+    # 3) union stem으로 전체 풀 구성
+    all_stem_sets = [set(map.keys()) for map in domain_image_maps.values() if map]
+    all_stems = sorted(set().union(*all_stem_sets))
+    rng.shuffle(all_stems)
 
-    # 1단계: 각 도메인별 single stem으로 1차 채우기
-    for d in domain_names:
-        pool = single_pools[d]
-        i = 0
-        while i < len(pool) and domain_counts[d] < target_per_domain and len(selected) < target:
-            stem = pool[i]
-            if stem not in selected_set:
-                selected.append(stem)
-                selected_set.add(stem)
-                for d2 in membership[stem]:
-                    domain_counts[d2] += 1
-            i += 1
+    # 4) train / val split
+    if max_val is not None:
+        num_val = min(max_val, max(1, int(len(all_stems) * val_ratio)))
+    else:
+        num_val = max(1, int(len(all_stems) * val_ratio))
 
-    # 2단계: multi_pool + 남은 single들을 섞어서 남은 자리를 채우기
-    remaining_needed = target - len(selected)
-    if remaining_needed > 0:
-        remaining_pool: list[str] = []
-        remaining_pool.extend(multi_pool)
-        for d in domain_names:
-            remaining_pool.extend([s for s in single_pools[d] if s not in selected_set])
+    val_stems_raw = all_stems[:num_val]
+    train_stems_raw = all_stems[num_val:]
 
-        rng.shuffle(remaining_pool)
+    if max_train is not None:
+        train_stems = select_balanced_stems(train_stems_raw, domain_image_maps, max_train, rng)
+    else:
+        train_stems = train_stems_raw
 
-        for stem in remaining_pool:
-            if len(selected) >= target:
-                break
-            if stem in selected_set:
-                continue
-            selected.append(stem)
-            selected_set.add(stem)
-            for d2 in membership[stem]:
-                domain_counts[d2] += 1
+    if max_val is not None:
+        val_stems = select_balanced_stems(val_stems_raw, domain_image_maps, max_val, rng)
+    else:
+        val_stems = val_stems_raw
 
-    return selected
+    print(
+        f"[SymlinkHelper] split: train {len(train_stems)}개, val {len(val_stems)}개 "
+        f"(val_ratio={val_ratio}, max_train={max_train}, max_val={max_val})"
+    )
+
+    return domain_image_maps, domain_label_maps, train_stems, val_stems

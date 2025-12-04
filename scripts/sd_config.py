@@ -11,6 +11,7 @@ VIRTUAL_IMAGES_VAL   = VIRTUAL_ROOT / "images" / "val"
 VIRTUAL_LABELS_TRAIN = VIRTUAL_ROOT / "labels" / "train"
 VIRTUAL_LABELS_VAL = VIRTUAL_ROOT / "labels" / "val"
 
+DATASET_YAML = VIRTUAL_ROOT / "multihead_data.yaml"
 
 DOMAIN_CONFIGS: list[DomainConfig] = [
     DomainConfig(
@@ -35,4 +36,5 @@ def sd_symlink_config_loader() -> SymlinkConfig:
         labels_train=VIRTUAL_LABELS_TRAIN,
         labels_val=VIRTUAL_LABELS_VAL,
         domain_configs=DOMAIN_CONFIGS,
+        dataset_yaml=DATASET_YAML
     )
