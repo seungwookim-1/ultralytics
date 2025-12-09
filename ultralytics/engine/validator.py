@@ -214,7 +214,14 @@ class BaseValidator:
             # Loss
             with dt[2]:
                 if self.training:
-                    self.loss += model.loss(batch, preds)[1]
+                    # trainer에 달린 플래그로 MoE 여부만 확인
+                    if getattr(trainer, "disable_val_loss", False):
+                        # MoETrainer: val loss는 계산하지 않고 metrics만 사용
+                        pass
+                    else:
+                        # 기존 YOLO: preds를 써서 val loss 계산 (원래 코드 유지)
+                        self.loss += model.loss(batch, preds)[1]
+
 
             # Postprocess
             with dt[3]:
