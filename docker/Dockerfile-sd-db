@@ -94,6 +94,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 #   -v "$(pwd)"/data:/ultralytics/data \
 #   -v "$(pwd)"/outputs:/ultralytics/outputs \
 #   -v "$(pwd)"/run:/ultralytics/run \
+#   -v "$(pwd)"/runs:/ultralytics/runs \
 #   -v "$(pwd)"/scripts:/ultralytics/scripts \
 #   -v "$(pwd)"/custom_core:/ultralytics/custom_core \
 #   -v "$(pwd)"/ultralytics:/ultralytics/ultralytics \

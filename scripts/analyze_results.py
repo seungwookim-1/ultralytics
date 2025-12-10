@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 import yaml
 
 
@@ -130,23 +131,99 @@ def plot_seed_boxplot(df: pd.DataFrame, out_path: Path):
     plt.close(fig)
     print(f"[INFO] Saved seed boxplot to {out_path}")
 
+def analyze_expert_heads(analysis_root):
+    df = pd.read_csv(analysis_root / "expert_usage_ratio.csv")
+
+    # 1) epoch 평균 / seed 평균 버전 생성
+    mean_df = (
+        df.groupby(["run", "model", "domain", "expert"])
+        [["global_p", "nonmoving_p", "rider_p", "delta"]]
+        .mean()
+        .reset_index()
+    )
+
+    mean_df.to_csv(analysis_root / "expert_usage_mean_by_run.csv", index=False)
+
+    # 2) expert × model pivot — 사람이 보기 쉬운 형태
+    pivot = mean_df.pivot_table(
+        index=["model", "expert"],
+        values=["nonmoving_p", "rider_p", "delta"],
+        aggfunc="mean"
+    )
+
+    pivot.to_csv(analysis_root / "expert_usage_pivot.csv")
+
+    # 3) 도메인 분리 스칼라 요약
+    summary = (
+        mean_df.groupby(["run"])
+            .agg(
+                mean_delta=("delta", "mean"),
+                abs_delta=("delta", lambda x: x.abs().mean())
+            )
+    )
+
+    summary.to_csv(analysis_root / "expert_usage_summary.csv")
+
+def plot_expert_usage_over_epochs(analysis_root, run_filter=None, model_filter=None):
+    df = pd.read_csv(analysis_root / "expert_usage_ratio.csv")
+
+    # 필요하면 run 또는 model 필터링
+    if run_filter is not None:
+        df = df[df["run"] == run_filter]
+    if model_filter is not None:
+        df = df[df["model"] == model_filter]
+
+    # epoch 순 정렬
+    df = df.sort_values(["epoch", "expert"])
+
+    # 1) 도메인별 expert 비율
+    for domain in df["domain"].unique():
+        sub = df[df["domain"] == domain]
+
+        plt.figure()
+        for e in sorted(sub["expert"].unique()):
+            s_e = sub[sub["expert"] == e]
+            plt.plot(s_e["epoch"], s_e["nonmoving_p" if domain == "nonmoving" else "rider_p"],
+                     label=f"expert {e}")
+        plt.xlabel("epoch")
+        plt.ylabel("usage ratio")
+        plt.title(f"Expert usage over epochs (domain={domain})")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(analysis_root / f"expert_usage_epochs_{domain}.png")
+        plt.close()
+
+    # 2) delta (도메인 분리 정도)
+    plt.figure()
+    for e in sorted(df["expert"].unique()):
+        s_e = df[df["expert"] == e]
+        plt.plot(s_e["epoch"], s_e["delta"], label=f"expert {e}")
+    plt.axhline(0.0, linestyle="--")
+    plt.xlabel("epoch")
+    plt.ylabel("delta (nonmoving_p - rider_p)")
+    plt.title("Expert domain-split (delta) over epochs")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(analysis_root / "expert_delta_over_epochs.png")
+    plt.close()
 
 # =========================
 # 공개 함수: 다른 스크립트에서 쓰는 진입점
 # =========================
-def run_analysis(project_root, out_dir):
+def run_analysis(results_root, analysis_root):
     """
-    project_root: runs가 들어있는 디렉토리 (str 또는 Path)
-    out_dir:     분석 결과를 저장할 디렉토리 (str 또는 Path)
+    results_root: runs가 들어있는 디렉토리 (str 또는 Path)
+    analysis_root:     분석 결과를 저장할 디렉토리 (str 또는 Path)
     """
-    project_root = Path(project_root)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    results_root = Path(results_root)
+    analysis_root = Path(analysis_root)
+    analysis_root.mkdir(parents=True, exist_ok=True)
 
     # 1) run 스캔 및 summary 테이블 생성
     rows = []
+    usage_rows = []
 
-    for run_dir in sorted(project_root.glob("*")):
+    for run_dir in sorted(results_root.glob("*")):
         results_file = run_dir / "results.csv"
         if not results_file.exists():
             continue
@@ -205,9 +282,44 @@ def run_analysis(project_root, out_dir):
 
         rows.append(row)
 
+        usage_file = run_dir / "moe_usage.json"
+        if usage_file.exists():
+            usage_data = json.loads(usage_file.read_text())
+
+            for rec in usage_data:
+                epoch = rec["epoch"]
+                g = np.array(rec["global_usage"])        # shape (num_scales, num_experts)
+                n = np.array(rec["nonmoving_usage"])     # shape (num_experts,)
+                r = np.array(rec["rider_usage"])         # shape (num_experts,)
+
+                # global: 스케일 합 → (E,)
+                g_sum = g.sum(axis=0)
+
+                # 정규화 (/sum) → 확률 분포
+                g_p = g_sum / g_sum.sum()
+                n_p = n / n.sum()
+                r_p = r / r.sum()
+
+                for expert_id in range(len(g_p)):
+                    usage_rows.append(
+                        {
+                            "run": run_dir.name,
+                            "model": model,
+                            "domain": domain,
+                            "seed": seed,
+                            "epoch": epoch,
+                            "expert": expert_id,
+                            "global_p": float(g_p[expert_id]),
+                            "nonmoving_p": float(n_p[expert_id]),
+                            "rider_p": float(r_p[expert_id]),
+                            "delta": float(n_p[expert_id] - r_p[expert_id]),
+                        }
+                    )
+
+
     summary = pd.DataFrame(rows)
     summary = summary.sort_values(["domain", "model", "seed"])
-    summary_path = out_dir / "summary_results_last_epoch.csv"
+    summary_path = analysis_root / "summary_results_last_epoch.csv"
     summary.to_csv(summary_path, index=False)
     print(f"[INFO] Saved summary to {summary_path}")
 
@@ -218,7 +330,7 @@ def run_analysis(project_root, out_dir):
         .agg(["mean", "std"])
     )
 
-    stats_path = out_dir / "group_stats.json"
+    stats_path = analysis_root / "group_stats.json"
     group_stats_json = json.loads(group_stats.to_json(orient="split"))
     with stats_path.open("w") as f:
         json.dump(group_stats_json, f, indent=2)
@@ -237,21 +349,61 @@ def run_analysis(project_root, out_dir):
         )
     )
 
-    pivot_path = out_dir / "pivot_mAP5095_domain_seed.csv"
+    pivot_path = analysis_root / "pivot_mAP5095_domain_seed.csv"
     pivot.to_csv(pivot_path)
     print(f"[INFO] Saved pivot table to {pivot_path}")
 
     print("\n=== Pivot: mAP50-95 per domain/seed (base vs moe) ===")
     print(pivot)
 
-    # 4) 그래프들
-    plot_domain_model_bar(summary, out_dir / "mAP5095_domain_model_bar.png")
-    plot_seed_boxplot(summary, out_dir / "mAP5095_domain_seed_boxplot.png")
+    # expert_usage_count = run_dir / "moe_usage.json"
+    # usage_data = json.loads(expert_usage_count.read_text())
 
-    print(f"\n[DONE] Analysis finished. See folder: {out_dir}")
+    # usage_rows = []
+    # for rec in data:
+    #     epoch = rec["epoch"]
+    #     g = np.array(rec["global"])        # shape (num_scales, num_experts)
+    #     n = np.array(rec["nonmoving"])     # shape (num_experts,)
+    #     r = np.array(rec["rider"])         # shape (num_experts,)
+
+    #     # 2) global: 스케일 차원 합치고 expert 축만 남기기
+    #     g_sum = g.sum(axis=0)  # (E,)
+
+    #     # 3) 정규화 (/sum) → 확률 분포
+    #     g_p = g_sum / g_sum.sum()
+    #     n_p = n / n.sum()
+    #     r_p = r / r.sum()
+
+    #     # 4) 테이블 형태로 정리
+    #     for expert_id in range(len(g_p)):
+    #         usage_rows.append(
+    #             {
+    #                 "epoch": epoch,
+    #                 "expert": expert_id,
+    #                 "global_p": float(g_p[expert_id]),
+    #                 "nonmoving_p": float(n_p[expert_id]),
+    #                 "rider_p": float(r_p[expert_id]),
+    #                 "delta": float(n_p[expert_id] - r_p[expert_id])
+    #             }
+    #         )
+    if usage_rows:
+        expert_usage = pd.DataFrame(usage_rows)
+        expert_usage_path = analysis_root / "expert_usage_ratio.csv"
+        expert_usage.to_csv(expert_usage_path)
+        print(f"[INFO] Saved expert usage ratio to {expert_usage_path}")
+        print(expert_usage[["epoch", "expert", "delta"]])
+    else:
+        print("[INFO] No moe_usage.json found in runs → skip expert usage export.")
+
+    # 4) 그래프들
+    plot_domain_model_bar(summary, analysis_root / "mAP5095_domain_model_bar.png")
+    # plot_seed_boxplot(summary, analysis_root / "mAP5095_domain_seed_boxplot.png")
+    analyze_expert_heads(analysis_root)
+    plot_expert_usage_over_epochs(analysis_root)
+    print(f"\n[DONE] Analysis finished. See folder: {analysis_root}")
 
 
 if __name__ == "__main__":
-    default_project_root = "/ultralytics/runs/single_moe_benchmark"
-    default_out_dir = "/ultralytics/outputs/analysis_moe_vs_single"
-    run_analysis(default_project_root, default_out_dir)
+    default_results_root = "/ultralytics/runs/multi_11n_moe_5k_temp"
+    default_analysis_root = "/ultralytics/runs/multi_11n_moe_5k_temp"
+    run_analysis(default_results_root, default_analysis_root)

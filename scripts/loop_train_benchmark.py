@@ -9,16 +9,23 @@ from analyze_results import run_analysis
 
 
 def main():
-    _name = "multi_11n_moe_5k_temp"
-    project_name = f"/ultralytics/runs/{_name}"
-    result_dir = f"/ultralytics/outputs/{_name}"
-    # seed_list = [0, 42, 777]
-    seed_list = [40]
+    _name = "multi_11n_moe_5k"
+    project_root = f"/ultralytics/runs/{_name}"
+    results_root = f"/ultralytics/runs/{_name}/results"
+    analysis_root = project_root
+    seed_list = [17, 23, 121]
     loader_pairs = [
         ("multi", sd_symlink_config_loader),
         # ("nonmoving", sd_symlink_config_loader_n),
         # ("rider", sd_symlink_config_loader_r),
     ]
+    dataset_mode = "TRAIN"
+    # dataset_mode = "DEBUG"
+    max_train = 5000
+    val_ratio = 0.1
+    max_val = (int) (max_train * val_ratio)
+    epochs = 50
+
     for seed in seed_list:
         for domain_name, loader in loader_pairs:
             install_freeze_warning_filter()
@@ -26,14 +33,18 @@ def main():
             register_symlink_config_loader(loader)
 
             # 1) dataset 고정
-            dataset_config_path = create_dataset_config(
-                val_ratio=0.1, seed=seed, max_train=1000, max_val=100
-            )
-            # dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
+            if dataset_mode == "TRAIN":
+                dataset_config_path = create_dataset_config(
+                    val_ratio=val_ratio, seed=seed, max_train=max_train, max_val=max_val
+                )
+            # debug: 마지막으로 생성된 dataset 사용
+            elif dataset_mode == "DEBUG":
+                dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
 
             common_hp = dict(
+                project=results_root,
                 data=str(dataset_config_path),
-                epochs=5,
+                epochs=epochs,
                 batch=16,
                 imgsz=640,
                 seed=seed,
@@ -55,16 +66,13 @@ def main():
 
             moe.ckpt = True
 
-            # results_base = base.train(
-            #     project=project_name,
-            #     **common_hp,
-            #     name=f"YOLOn_{domain_name}_s{seed}",
-            # )
-
+            results_base = base.train(
+                **common_hp,
+                name=f"YOLOn_{domain_name}_s{seed}",
+            )
+            
             # 7) MoE 학습
-
             results_moe = moe.train(
-                project=project_name,
                 trainer=MoETrainer,   # 여기서 teacher를 model에 붙여주기만 함
                 # moe_kd_weight=1.0,    # model.args로 들어가서 MoEDetectionLoss가 읽음
                 # moe_kd_temp=1.0,
@@ -73,20 +81,10 @@ def main():
             )
 
             # results_base_s = base_s.train(
-            #     project=project_name,
             #     **common_hp,
             #     name=f"YOLOs_{domain_name}_s{seed}",
-            # )
-
-            # Analyze expert specialization
-            # print("Expert usage (global):", moe_head.expert_counts)
-
-            # if hasattr(moe_head, "expert_counts_nonmoving"):
-            #     print("Expert usage (nonmoving):", moe_head.expert_counts_nonmoving)
-            # if hasattr(moe_head, "expert_counts_rider"):
-            #     print("Expert usage (rider):", moe_head.expert_counts_rider)
-    
-    run_analysis(project_name, result_dir)
+            # )   
+    run_analysis(results_root, analysis_root)
 
 
 if __name__ == "__main__":
