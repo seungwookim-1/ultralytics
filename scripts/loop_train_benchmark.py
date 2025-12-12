@@ -21,7 +21,7 @@ from random_param_search import MoEParams
 def create_project_config() -> ProjectConfig:
     cfg =  ProjectConfig(
         name="multi_11n_moe_param_test_1",
-        seed_list=[11, 59, 61],
+        seed_list=[15, 59, 61],
         random_trial_counts=20,
         loader_pairs = [
             ("multi", sd_symlink_config_loader),
@@ -32,9 +32,9 @@ def create_project_config() -> ProjectConfig:
         param_mode="RANDOM",
         # dataset_mode="DEBUG",
         # param_mode="FIXED",
-        max_train=3000,
+        max_train=5000,
         val_ratio=0.1,
-        epochs=20,
+        epochs=30,
         run_analysis=True,
     )
     if cfg.param_mode == "FIXED":
@@ -170,7 +170,8 @@ def run_random_param_search(cfg: ProjectConfig):
             skip_baseline = True
 
     if cfg.run_analysis:
-        run_param_analysis(cfg.results_root, cfg.analysis_root, None, False)
+        run_analysis(Path(cfg.results_root), Path(cfg.analysis_root))
+        run_param_analysis(Path(cfg.results_root), Path(cfg.analysis_root), None, True)
 
 def run_param_fixed_eval(cfg: ProjectConfig):
     moe_params = cfg.moe_fixed_params
@@ -200,7 +201,7 @@ def run_param_fixed_eval(cfg: ProjectConfig):
             )
 
     if cfg.run_analysis:
-        run_analysis(cfg.results_root, cfg.analysis_root)
+        run_analysis(Path(cfg.results_root), Path(cfg.analysis_root))
 
 def main():
     cfg = create_project_config()

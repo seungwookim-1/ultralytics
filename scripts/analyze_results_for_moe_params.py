@@ -300,9 +300,9 @@ def run_param_analysis(
 
 if __name__ == "__main__":
     default_results_root = Path(
-        "/ultralytics/outputs/multi_11n_moe_param_test_0/results"
+        "/ultralytics/outputs/multi_11n_moe_param_test_1/results"
     )
     default_analysis_root = Path(
-        "/ultralytics/outputs/multi_11n_moe_param_test_0"
+        "/ultralytics/outputs/multi_11n_moe_param_test_1"
     )
     run_param_analysis(default_results_root, default_analysis_root)

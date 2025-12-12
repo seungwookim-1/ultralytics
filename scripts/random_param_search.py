@@ -36,12 +36,12 @@ class MoEParams:
         return cls(
             random=True,
             num_experts=4,
-            moe_aux_loss=uniform(0.01, 0.02),
+            moe_aux_loss=uniform(0.011, 0.019),
             moe_kd_weight=0.0,
             moe_kd_temp=1.0,
-            lambda_entropy=uniform(0.10, 0.20),
-            lambda_balance=loguniform(2.0, 4.0),
-            noise_scale=uniform(0.005, 0.02),
+            lambda_entropy=uniform(0.13, 0.19),
+            lambda_balance=loguniform(2.5, 4.5),
+            noise_scale=uniform(0.005, 0.015),
         )
 
     @classmethod

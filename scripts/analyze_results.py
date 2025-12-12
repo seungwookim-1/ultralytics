@@ -410,6 +410,6 @@ def run_analysis(results_root, analysis_root):
 
 
 if __name__ == "__main__":
-    default_results_root = "/ultralytics/runs/multi_11n_moe_5k_temp"
-    default_analysis_root = "/ultralytics/runs/multi_11n_moe_5k_temp"
+    default_results_root = Path("/ultralytics/outputs/multi_11n_moe_param_test_1/results")
+    default_analysis_root = Path("/ultralytics/outputs/multi_11n_moe_param_test_1")
     run_analysis(default_results_root, default_analysis_root)
