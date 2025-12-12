@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import Any
+from typing import Any, List
 import numpy as np
 import torch
 from .dataclass.usage_logger import MoEUsageRecord

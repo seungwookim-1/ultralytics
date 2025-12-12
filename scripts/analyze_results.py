@@ -1,9 +1,9 @@
-# analyze_results.py
 import json
 from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+import re
 import yaml
 
 
@@ -12,24 +12,32 @@ import yaml
 # =========================
 def parse_run_name(run_name: str):
     """
-    예: 'moe_multi_s42' -> model='moe', domain='multi', seed=42
-        'base_nonmoving_s0' -> model='base', domain='nonmoving', seed=0
+    새로운 네이밍 규칙을 지원하는 파서.
+    
+    MoE 예:
+        MoE_trial3_multi_BAL2.00_ENT0.08_AUX0.030_NS0.015_s11
+    Baseline 예:
+        YOLOn_multi_s11
     """
-    parts = run_name.split("_")
-    if len(parts) < 3:
-        # 예상치 못한 이름이면 안전하게 처리
-        return None, None, None
 
-    model = parts[0]       # 'base' or 'moe'
-    domain = parts[1]      # 'multi' / 'nonmoving' / 'rider' ...
-    seed_str = parts[2]    # 's0', 's42' ...
+    # Baseline pattern
+    m = re.match(r"^(YOLO[a-z])_(\w+)_s(\d+)$", run_name)
+    if m:
+        return ("base", m.group(2), int(m.group(3)))
 
-    try:
-        seed = int(seed_str.lstrip("s"))
-    except ValueError:
-        seed = None
+    # MoE pattern
+    m = re.match(
+        r"^MoE_(trial\d+_)?(\w+)_BAL([0-9.]+)_ENT([0-9.]+)_AUX([0-9.]+)_NS([0-9.]+)_s(\d+)$",
+        run_name
+    )
+    if m:
+        domain = m.group(2)
+        seed = int(m.group(7))
+        return ("moe", domain, seed)
 
-    return model, domain, seed
+    # Unknown pattern
+    print(f"[WARN] Cannot parse run name: {run_name}")
+    return None, None, None
 
 
 def load_args_yaml(run_dir: Path):
@@ -215,8 +223,6 @@ def run_analysis(results_root, analysis_root):
     results_root: runs가 들어있는 디렉토리 (str 또는 Path)
     analysis_root:     분석 결과를 저장할 디렉토리 (str 또는 Path)
     """
-    results_root = Path(results_root)
-    analysis_root = Path(analysis_root)
     analysis_root.mkdir(parents=True, exist_ok=True)
 
     # 1) run 스캔 및 summary 테이블 생성

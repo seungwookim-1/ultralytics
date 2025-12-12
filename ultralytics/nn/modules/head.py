@@ -1298,7 +1298,6 @@ class MoEDetect(Detect):
 
         # 통계용 usage 카운트 (buffer로 등록 → EMA / deepcopy 안전)
         self.register_buffer("expert_counts", torch.zeros(self.nl, num_experts))
-
         self.register_buffer("expert_counts_nonmoving", torch.zeros(num_experts))
         self.register_buffer("expert_counts_rider", torch.zeros(num_experts))
 
@@ -1365,7 +1364,7 @@ class MoEDetect(Detect):
         return det if self.export else (det, x)
 
     @torch.no_grad()
-    def init_from_detect(self, detect_head: Detect, noise_scale: float = 0.01) -> None:
+    def init_from_detect(self, detect_head: Detect) -> None:
         """
         기존 Detect head로부터 expert 0의 가중치를 복사하고,
         나머지 expert에는 약간의 노이즈를 추가해 초기화.
@@ -1376,6 +1375,11 @@ class MoEDetect(Detect):
         """
         assert isinstance(detect_head, Detect)
         assert detect_head.nl == self.nl
+
+        noise_scale = getattr(self, "noise_scale", 0.01)
+        print(f"[MoE init] noise_scale={float(noise_scale):.5f}, "
+            f"lambda_entropy={getattr(self, 'lambda_entropy', None)}, "
+            f"lambda_balance={getattr(self, 'lambda_balance', None)}")
 
         if detect_head.nc != self.nc:
             print(
@@ -1443,8 +1447,8 @@ class MoEDetect(Detect):
             balance = ((mean_usage - uniform) ** 2).mean()
             total_balance = total_balance + balance
 
-        lambda_entropy = 0.05
-        lambda_balance = 1.0
+        lambda_entropy = getattr(self, "moe_lambda_entropy", 0.05)
+        lambda_balance = getattr(self, "moe_lambda_balance", 1.0)
 
         aux_loss = (
             lambda_balance * total_balance
