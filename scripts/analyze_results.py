@@ -27,8 +27,9 @@ def parse_run_name(run_name: str):
 
     # MoE pattern
     m = re.match(
-        r"^MoE_(trial\d+_)?(\w+)_BAL([0-9.]+)_ENT([0-9.]+)_AUX([0-9.]+)_NS([0-9.]+)_s(\d+)$",
-        run_name
+    r"^MoE_(trial\d+_)?(\w+)_BAL([0-9.]+)_ENT([0-9.]+)_AUX([0-9.]+)_NS([0-9.]+)"
+    r"(?:_SCHED_[A-Za-z0-9_\.]+)?_s(\d+)$",
+    run_name
     )
     if m:
         domain = m.group(2)
@@ -67,6 +68,15 @@ def flatten_dict(d, parent_key: str = "", sep: str = "/"):
             items.append((new_key, v))
     return dict(items)
 
+def load_moe_schedule(run_dir: Path) -> dict | None:
+    sched_path = run_dir / "moe_schedule.json"
+    if not sched_path.exists():
+        return None
+    try:
+        return json.loads(sched_path.read_text())
+    except Exception as e:
+        print(f"[WARN] Failed to load {sched_path}: {e}")
+        return None
 
 def plot_domain_model_bar(df: pd.DataFrame, out_path: Path):
     """
@@ -249,6 +259,29 @@ def run_analysis(results_root, analysis_root):
         args = load_args_yaml(run_dir)
         flat_args = flatten_dict(args)
 
+        schedule = load_moe_schedule(run_dir)
+        
+        if schedule is None:
+            schedule_tag = "NOSCHED"
+            schedule_param = None
+            schedule_min = None
+            schedule_max = None
+        else:
+            schedule_tag = schedule.get("tag", "UNKNOWN")
+
+            # 어떤 파라미터가 스케줄링 대상인지 자동 추론
+            schedule_param = None
+            schedule_min = None
+            schedule_max = None
+            for k in ("lambda_balance", "lambda_entropy", "noise_scale"):
+                if k in schedule:
+                    cfg = schedule[k]
+                    if cfg.get("m_min") != 1.0 or cfg.get("m_max") != 1.0:
+                        schedule_param = k
+                        schedule_min = cfg.get("m_min")
+                        schedule_max = cfg.get("m_max")
+                        break
+
         row = {
             "run": run_dir.name,
             "model": model,
@@ -259,6 +292,11 @@ def run_analysis(results_root, analysis_root):
             "recall": last.get("metrics/recall(B)", float("nan")),
             "mAP50": last.get("metrics/mAP50(B)", float("nan")),
             "mAP5095": last.get("metrics/mAP50-95(B)", float("nan")),
+            "schedule_tag": schedule_tag,
+            "schedule_param": schedule_param,
+            "schedule_min": schedule_min,
+            "schedule_max": schedule_max,
+            "has_schedule": schedule is not None,
         }
 
         important_keys = [
@@ -410,6 +448,8 @@ def run_analysis(results_root, analysis_root):
 
 
 if __name__ == "__main__":
-    default_results_root = Path("/ultralytics/outputs/multi_11n_moe_param_test_1/results")
-    default_analysis_root = Path("/ultralytics/outputs/multi_11n_moe_param_test_1")
+    default_analysis_root = Path(
+        "/ultralytics/outputs/aux_weight_test_1"
+    )
+    default_results_root = default_analysis_root / "results"
     run_analysis(default_results_root, default_analysis_root)

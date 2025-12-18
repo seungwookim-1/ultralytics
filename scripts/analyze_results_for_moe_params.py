@@ -30,8 +30,9 @@ def parse_run_name(run_name: str):
 
     # MoE: MoE_trial0_multi_BAL2.00_ENT0.10_AUX0.020_NS0.010_s11
     m = re.match(
-        r"^MoE_(trial\d+_)?(\w+)_BAL([0-9.]+)_ENT([0-9.]+)_AUX([0-9.]+)_NS([0-9.]+)_s(\d+)$",
-        run_name,
+        r"^MoE_(trial\d+_)?(\w+)_BAL([0-9.]+)_ENT([0-9.]+)_AUX([0-9.]+)_NS([0-9.]+)"
+        r"(?:_SCHED_[A-Za-z0-9_\.]+)?_s(\d+)$",
+        run_name
     )
     if m:
         domain = m.group(2)
@@ -48,6 +49,15 @@ def load_moe_params_if_exists(run_dir: Path):
         return {}
     return json.loads(f.read_text())
 
+def load_moe_schedule(run_dir: Path) -> dict | None:
+    sched_path = run_dir / "moe_schedule.json"
+    if not sched_path.exists():
+        return None
+    try:
+        return json.loads(sched_path.read_text())
+    except Exception as e:
+        print(f"[WARN] Failed to load {sched_path}: {e}")
+        return None
 
 def load_args_yaml(run_dir: Path):
     for name in ("args.yaml", "hyp.yaml", "opt.yaml"):
@@ -119,6 +129,46 @@ def run_param_analysis(
 
         rows.append(base_row)
 
+
+    #####################
+
+        schedule = load_moe_schedule(run_dir)
+
+        if schedule is None:
+            base_row.update({
+                "has_schedule": False,
+                "schedule_tag": "NOSCHED",
+                "schedule_param": None,
+                "schedule_min": None,
+                "schedule_max": None,
+            })
+        else:
+            schedule_tag = schedule.get("tag", "UNKNOWN")
+
+            schedule_param = None
+            schedule_min = None
+            schedule_max = None
+
+            for k in ("lambda_balance", "lambda_entropy", "noise_scale"):
+                if k in schedule:
+                    cfg = schedule[k]
+                    if cfg.get("m_min") != 1.0 or cfg.get("m_max") != 1.0:
+                        schedule_param = k
+                        schedule_min = cfg.get("m_min")
+                        schedule_max = cfg.get("m_max")
+                        break
+
+            base_row.update({
+                "has_schedule": True,
+                "schedule_tag": schedule_tag,
+                "schedule_param": schedule_param,
+                "schedule_min": schedule_min,
+                "schedule_max": schedule_max,
+            })
+
+        rows.append(base_row)
+
+#####
     df = pd.DataFrame(rows)
     summary_path = analysis_root / "moe_param_summary.csv"
     df.to_csv(summary_path, index=False)
@@ -136,7 +186,7 @@ def run_param_analysis(
     param_cols = [
         "lambda_balance",
         "lambda_entropy",
-        "moe_aux_loss",
+        "aux_loss_weight",
         "noise_scale",
     ]
     param_cols_present = [p for p in param_cols if p in df_moe.columns]
@@ -285,8 +335,25 @@ def run_param_analysis(
     trial_table.to_csv(trial_table_path, index=False)
     print(f"[INFO] Saved trial table → {trial_table_path}")
 
+
+    df_sched = df[df["has_schedule"]]
+
+    for param in ["lambda_balance", "lambda_entropy", "noise_scale"]:
+        sub = df_sched[df_sched["schedule_param"] == param]
+        if sub.empty:
+            continue
+
+        pivot = sub.pivot_table(
+            index="schedule_min",
+            values="mAP5095",
+            aggfunc=["mean", "std"],
+        )
+        print(f"\n[SCHEDULE RESULT] {param}")
+        print(pivot)
+
+
     # ---------------------------
-    # 8) Top-K parameter selection
+    # *) Top-K parameter selection
     # ---------------------------
     if top_k is not None:
         top = df_moe.sort_values("mAP5095", ascending=False).head(top_k)
@@ -299,10 +366,8 @@ def run_param_analysis(
 
 
 if __name__ == "__main__":
-    default_results_root = Path(
-        "/ultralytics/outputs/multi_11n_moe_param_test_1/results"
-    )
     default_analysis_root = Path(
-        "/ultralytics/outputs/multi_11n_moe_param_test_1"
+        "/ultralytics/outputs/aux_weight_test_1"
     )
+    default_results_root = default_analysis_root / "results"
     run_param_analysis(default_results_root, default_analysis_root)

@@ -255,7 +255,7 @@ class TestMoEIntegration:
 
         class MockModel:
             class Args:
-                moe_aux_loss = 0.01
+                aux_loss_weight = 0.01
 
             args = Args()
             model = [None]

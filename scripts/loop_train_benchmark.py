@@ -20,7 +20,7 @@ from random_param_search import MoEParams
 
 def create_project_config() -> ProjectConfig:
     cfg =  ProjectConfig(
-        name="multi_11n_moe_param_test_1",
+        name="multi_11n_moe_param_test_fix",
         seed_list=[15, 59, 61],
         random_trial_counts=20,
         loader_pairs = [
@@ -28,18 +28,18 @@ def create_project_config() -> ProjectConfig:
             # ("nonmoving", sd_symlink_config_loader_n),
             # ("rider", sd_symlink_config_loader_r),
             ],
-        dataset_mode="TRAIN",
+        dataset_mode="DEBUG",
         param_mode="RANDOM",
         # dataset_mode="DEBUG",
         # param_mode="FIXED",
-        max_train=5000,
+        max_train=1000,
         val_ratio=0.1,
         epochs=30,
         run_analysis=True,
     )
     if cfg.param_mode == "FIXED":
         cfg.moe_fixed_params = MoEParams.fixed(
-        moe_aux_loss=0.03,
+        aux_loss_weight=0.03,
         lambda_entropy=0.08,
         lambda_balance=2.0,
         noise_scale=0.015,
@@ -84,24 +84,25 @@ def run_benchmark(
     moe_head  = moe.model.model[-1]
     assert isinstance(moe_head, MoEDetect)
 
-    args = moe.model.args
+    # args = moe.model.args
 
-    if isinstance(args, dict):
-        args = SimpleNamespace(**args)
-        moe.model.args = args  # overwrite
+    # if isinstance(args, dict):
+    #     args = SimpleNamespace(**args)
+    #     moe.model.args = args  # overwrite
 
-    # ---- apply MoE params ----
-    for k, v in moe_params.to_dict().items():
-        setattr(args, k, v)
+    # # ---- apply MoE params ----
+    # for k, v in moe_params.to_dict().items():
+    #     setattr(args, k, v)
+    # print("args:", args)
 
     # detect head에는 필드 기반으로 주입
-    moe_head.lambda_entropy = moe_params.lambda_entropy
-    moe_head.lambda_balance = moe_params.lambda_balance
-    moe_head.noise_scale = moe_params.noise_scale
+    # moe_head.lambda_entropy = moe_params.lambda_entropy
+    # moe_head.lambda_balance = moe_params.lambda_balance
+    # moe_head.noise_scale = moe_params.noise_scale
 
-    moe_head.init_from_detect(base_head)
+    moe_head.init_from_detect(base_head, moe_params.noise_scale)
 
-    params_sanity_check(args, moe_head, moe_params)
+    # params_sanity_check(args, moe_head, moe_params)
     print(f"[Seed {seed}][{domain_name}] Random MoE Params = {moe_params}")
 
     moe.ckpt = True
@@ -115,10 +116,12 @@ def run_benchmark(
     
     # 7) MoE 학습
     tag = f"BAL{moe_params.lambda_balance:.2f}_ENT{moe_params.lambda_entropy:.2f}_" \
-            f"AUX{moe_params.moe_aux_loss:.3f}_NS{moe_params.noise_scale:.3f}"
+            f"AUX{moe_params.aux_loss_weight:.3f}_NS{moe_params.noise_scale:.3f}"
 
     trial_part = f"trial{trial_idx}_" if trial_idx is not None else ""
     moe_dir_name = f"MoE_{trial_part}{domain_name}_{tag}_s{seed}"
+
+    MoETrainer.MOE_PARAMS = moe_params
 
     results_moe = moe.train(
         trainer=MoETrainer,
@@ -209,27 +212,10 @@ def main():
     # Random parameter sampling. Dataset fixed
     if cfg.param_mode == "RANDOM":
         run_random_param_search(cfg)
-        # for trial_idx, moe_params in enumerate(trial_params):
-        #     run_benchmark(cfg, moe_params, search_seed, trial_idx, skip_baseline)
-        #     base_run_dir = cfg.results_root / f"YOLOn_{cfg.loader_pairs[0][0]}_s{search_seed}"
-        #     if (base_run_dir / "results.csv").exists():
-        #         skip_baseline = True
-        # if cfg.run_analysis:
-        #     run_param_analysis(cfg.results_root, cfg.analysis_root, None, False)
 
     # Random dataset sampling. MoE parameters fixed
     elif cfg.param_mode == "FIXED":
         run_param_fixed_eval(cfg)
-        # moe_params = MoEParams.fixed(
-        #     moe_aux_loss=0.03,
-        #     lambda_entropy=0.08,
-        #     lambda_balance=2.0,
-        #     noise_scale=0.015
-        # )
-        # for seed in cfg.seed_list:
-        #     run_benchmark(cfg, moe_params, seed)
-        # if cfg.run_analysis:
-        #     run_analysis(cfg.results_root, cfg.analysis_root)
 
 if __name__ == "__main__":
     main()

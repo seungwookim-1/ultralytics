@@ -16,7 +16,7 @@ def loguniform(a, b):
 class MoEParams:
     num_experts: int = 4
 
-    moe_aux_loss: float = 0.01
+    aux_loss_weight: float = 0.01
     moe_kd_weight: float = 0.0
     moe_kd_temp: float = 1.0
 
@@ -36,7 +36,7 @@ class MoEParams:
         return cls(
             random=True,
             num_experts=4,
-            moe_aux_loss=uniform(0.011, 0.019),
+            aux_loss_weight=uniform(0.011, 0.019),
             moe_kd_weight=0.0,
             moe_kd_temp=1.0,
             lambda_entropy=uniform(0.13, 0.19),
@@ -53,7 +53,7 @@ class MoEParams:
         """trainer나 model.args 주입 시 쓰기 편하도록 dict로 변환"""
         return {
             "num_experts": self.num_experts,
-            "moe_aux_loss": self.moe_aux_loss,
+            "aux_loss_weight": self.aux_loss_weight,
             "moe_kd_weight": self.moe_kd_weight,
             "moe_kd_temp": self.moe_kd_temp,
             "lambda_entropy": self.lambda_entropy,

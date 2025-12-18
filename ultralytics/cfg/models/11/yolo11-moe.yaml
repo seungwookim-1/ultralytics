@@ -6,12 +6,12 @@
 nc: 80 # number of classes
 num_experts: 4 # number of expert heads in MoE
 moe_teacher: ""
-moe_aux_loss: 0.01 # auxiliary loss weight for load balancing
+aux_loss_weight: 0.01 # auxiliary loss weight for load balancing
 moe_kd_weight: 0.0
 moe_kd_temp: 1.0
 # moe_aux_warmup: 5 # number of epochs to warmup the auxiliary loss
-moe_lambda_entropy: 0.05
-moe_lambda_balance: 1.0
+lambda_entropy: 0.05
+lambda_balance: 1.0
 
 scales: # model compound scaling constants
     # [depth, width, max_channels]

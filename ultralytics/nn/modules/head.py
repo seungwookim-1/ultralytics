@@ -1204,15 +1204,20 @@ class LinearRouter(nn.Module):
         routing_logits:   [B, E]
     """
 
-    def __init__(self, in_channels: int, num_experts: int, temperature: float = 1.0):
+    def __init__(self, in_channels: int, num_experts: int, temperature: float = 1.0, noise_scale: float = 0.01):
         super().__init__()
         self.num_experts = num_experts
-        self.temperature = temperature
+        self.temperature = float(temperature)
+        self.noise_scale = float(noise_scale)
         self.conv = nn.Conv2d(in_channels, num_experts, kernel_size=1, bias=True)
 
     @torch.no_grad()
     def set_temperature(self, temperature: float) -> None:
         self.temperature = float(temperature)
+
+    @torch.no_grad()
+    def set_noise_scale(self, noise_scale: float) -> None:
+        self.noise_scale = float(noise_scale)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1301,6 +1306,8 @@ class MoEDetect(Detect):
         self.register_buffer("expert_counts_nonmoving", torch.zeros(num_experts))
         self.register_buffer("expert_counts_rider", torch.zeros(num_experts))
 
+        
+
     def forward(self, x):
         """
         Args:
@@ -1364,7 +1371,7 @@ class MoEDetect(Detect):
         return det if self.export else (det, x)
 
     @torch.no_grad()
-    def init_from_detect(self, detect_head: Detect) -> None:
+    def init_from_detect(self, detect_head: Detect, noise_scale: float) -> None:
         """
         기존 Detect head로부터 expert 0의 가중치를 복사하고,
         나머지 expert에는 약간의 노이즈를 추가해 초기화.
@@ -1376,10 +1383,10 @@ class MoEDetect(Detect):
         assert isinstance(detect_head, Detect)
         assert detect_head.nl == self.nl
 
-        noise_scale = getattr(self, "noise_scale", 0.01)
-        print(f"[MoE init] noise_scale={float(noise_scale):.5f}, "
-            f"lambda_entropy={getattr(self, 'lambda_entropy', None)}, "
-            f"lambda_balance={getattr(self, 'lambda_balance', None)}")
+        # noise_scale = getattr(self, "noise_scale", 0.01)
+        print(f"[MoE init] noise_scale={float(noise_scale):.5f}")
+        #     f"lambda_entropy={getattr(self, 'lambda_entropy', None)}, "
+        #     f"lambda_balance={getattr(self, 'lambda_balance', None)}")
 
         if detect_head.nc != self.nc:
             print(
@@ -1447,12 +1454,31 @@ class MoEDetect(Detect):
             balance = ((mean_usage - uniform) ** 2).mean()
             total_balance = total_balance + balance
 
-        lambda_entropy = getattr(self, "moe_lambda_entropy", 0.05)
-        lambda_balance = getattr(self, "moe_lambda_balance", 1.0)
+        lambda_entropy = getattr(self, "lambda_entropy", 0.05)
+        lambda_balance = getattr(self, "lambda_balance", 1.0)
+        # print("[DBG] lambda_entropy/balance used:", lambda_entropy, lambda_balance)
 
         aux_loss = (
             lambda_balance * total_balance
             - lambda_entropy * total_entropy
         ) / num_scales
+        # print(f"[DBG]aux_loss {aux_loss} = (lambda_balance {lambda_balance} * total_balance {total_balance} - lambda_entropy {lambda_entropy} * total_entropy {total_entropy}) / num_scales {num_scales}")
 
         return aux_loss
+
+    def apply_moe_schedule(self, epoch: int, max_epoch: int,
+                       base_T: float,
+                       base_entropy: float,
+                       base_balance: float,
+                       base_noise: float,
+                       warmup_ratio: float = 0.3,
+                       mid_ratio: float = 0.6):
+        assert max_epoch and max_epoch > 0
+        epoch_progress = epoch / max_epoch
+
+        if epoch_progress < warmup_ratio:
+            pass
+        elif epoch_progress < mid_ratio:
+            pass
+        else:
+            pass

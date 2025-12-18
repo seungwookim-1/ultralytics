@@ -31,82 +31,35 @@ class MoEUsageLogger:
         except TypeError:
             return None
 
-    def _set_router_temperature(self):
-        epoch = getattr(self.trainer, "epoch", 0)
-        max_epoch = getattr(self.trainer, "epochs", None)
-
-        if epoch < 10:
-            T = 1.5
-        elif epoch < 30:
-            T = 1.2
-        else:
-            T = 1.0
-
-        if not hasattr(self.head, "routers"):
-            return
-
-        for router in self.head.routers:
-            if hasattr(router, "set_temperature"):
-                router.set_temperature(T)
-
     # Callback Entry Points
-
     def on_train_start(self):
+        if getattr(self, "_started", False):
+            return
+        self._started = True
         if hasattr(self.head, "reset_usage"):
             self.head.reset_usage()
         self.usage_history.clear()
+        print("[MoETrainer] MoE usage history cleared")
 
     def on_train_epoch_start(self):
+        epoch = getattr(self.trainer, "epoch", None)
+        if epoch is not None and getattr(self, "_last_reset_epoch", None) == epoch:
+            return
+        self._last_reset_epoch = epoch
         if hasattr(self.head, "reset_usage"):
             self.head.reset_usage()
-
-        self._set_router_temperature()
 
     def on_train_batch_end(self, batch, routing_info):
         if routing_info is None:
             return
-        # cls = batch["cls"]
-        # print(
-        #     "[MoETrainer] batch_cls:",
-        #     "type=", type(cls),
-        #     "shape=", getattr(cls, "shape", None),
-        #     "min=", cls.min().item() if hasattr(cls, "min") and cls.size != 0 else None,
-        #     "max=", cls.max().item() if hasattr(cls, "max") and cls.size != 0 else None,
-        # )
         self._update_domain_usage(batch, routing_info)
 
     def on_train_epoch_end(self, epoch_idx: int):
         self._log_usage_epoch(epoch_idx)
 
     def on_train_end(self):
-        # 마지막 epoch도 한 번 더 찍어주고 싶다면 여기에서 print 가능
-        if self.usage_history:
-            last = self.usage_history[-1]
-            last_epoch = last.epoch + 1
+        self._save_usage_history()
 
-            g_print = torch.tensor(last.global_usage)
-            print(f"[MoETrainer] Final epoch {last_epoch} usage:")
-            print("  Global   :", g_print)
-
-            if last.nonmoving_usage is not None:
-                n_print = torch.tensor(last.nonmoving_usage)
-                print("  Nonmoving:", n_print)
-
-            if last.rider_usage is not None:
-                r_print = torch.tensor(last.rider_usage)
-                print("  Rider    :", r_print)
-
-        save_dir = getattr(self.trainer, "save_dir", None)
-        if save_dir is None:
-            return
-
-        path = Path(save_dir) / "moe_usage.json"
-        usage_history_dict = [asdict(record) for record in self.usage_history]
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(usage_history_dict, f, ensure_ascii=False, indent=2)
-
-        print(f"[MoETrainer] Saved MoE usage history to {path}")
 
     def _update_domain_usage(self, batch, routing_info):
         if self.moe_domain_split is None:
@@ -253,3 +206,33 @@ class MoEUsageLogger:
             print("  Nonmoving:", torch.tensor(record.nonmoving_usage))
         if record.rider_usage is not None:
             print("  Rider    :", torch.tensor(record.rider_usage))
+
+    def _save_usage_history(self):
+        if self.usage_history:
+            last = self.usage_history[-1]
+            last_epoch = last.epoch + 1
+
+            g_print = torch.tensor(last.global_usage)
+            print(f"[MoETrainer] Final epoch {last_epoch} usage:")
+            print("  Global   :", g_print)
+
+            if last.nonmoving_usage is not None:
+                n_print = torch.tensor(last.nonmoving_usage)
+                print("  Nonmoving:", n_print)
+
+            if last.rider_usage is not None:
+                r_print = torch.tensor(last.rider_usage)
+                print("  Rider    :", r_print)
+
+        save_dir = getattr(self.trainer, "save_dir", None)
+        if save_dir is None:
+            print(f"[MoETrainer] Failed to save MoE usage history : save_dir is None")    
+            return
+
+        path = Path(save_dir) / "moe_usage.json"
+        usage_history_dict = [asdict(record) for record in self.usage_history]
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(usage_history_dict, f, ensure_ascii=False, indent=2)
+
+        print(f"[MoETrainer] Saved MoE usage history to {path}")

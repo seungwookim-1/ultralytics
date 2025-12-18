@@ -313,15 +313,20 @@ class MoEDetectionLoss(v8DetectionLoss):
         self.model = model
         self.teacher = teacher_model
 
-        self.aux_loss_weight = getattr(model.args, "moe_aux_loss", 1.0)
-        self.kd_weight = getattr(model.args, "moe_kd_weight", 0.0)
-        self.kd_temp  = getattr(model.args, "moe_kd_temp", 1.0)
+        # self.aux_loss_weight = getattr(model.args, "aux_loss_weight", 1.0)
+        # self.kd_weight = getattr(model.args, "moe_kd_weight", 0.0)
+        # self.kd_temp  = getattr(model.args, "moe_kd_temp", 1.0)
 
     def __call__(self, preds, batch):
         det_vec, loss_items = super().__call__(preds, batch)
         det_loss = det_vec.sum()
         total_loss = det_loss
 
+        head = self.model.model[-1]
+
+        aux_loss_weight = getattr(head, "aux_loss_weight", None)
+        if aux_loss_weight is None:
+            aux_loss_weight = 0.0
         # ---------------------------
         # 1) MoE aux loss
         # ---------------------------
@@ -329,8 +334,17 @@ class MoEDetectionLoss(v8DetectionLoss):
         if self.model.training:
             aux_loss = MOE_CONTEXT.pop("aux_loss", None)
 
-        if aux_loss is not None and self.aux_loss_weight > 0:
-            total_loss = total_loss + self.aux_loss_weight * aux_loss
+        if aux_loss is not None:
+            ratio = aux_loss.abs() / (det_loss.detach() + 1e-6)
+            if ratio > 0.5:
+                print(f"[WARN] aux_loss dominates det_loss: ratio={ratio:.2f}")
+
+
+        if aux_loss is not None and aux_loss_weight != 0:
+            total_loss = total_loss + aux_loss_weight * aux_loss
+        elif aux_loss_weight == 0:
+            print("[MoEDetectionLoss] aux_loss_weight is 0")
+            # print(f"total_loss {total_loss} = total_loss {total_loss} + self.aux_loss_weight {self.aux_loss_weight} * aux_loss {aux_loss}")
 
         # ---------------------------
         # 2) (optional) KD loss
