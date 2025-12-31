@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os, time
 from typing import Any
 from logging import Logger
 import torch
@@ -307,15 +308,100 @@ class MoEDetectionLoss(v8DetectionLoss):
     """
     YOLO v8 DetectionLoss + MoE load-balance loss + (optional) KD loss.
     """
-
     def __init__(self, model, teacher_model=None):
         super().__init__(model)
         self.model = model
         self.teacher = teacher_model
 
-        # self.aux_loss_weight = getattr(model.args, "aux_loss_weight", 1.0)
-        # self.kd_weight = getattr(model.args, "moe_kd_weight", 0.0)
-        # self.kd_temp  = getattr(model.args, "moe_kd_temp", 1.0)
+        # 로깅 설정
+        self.aux_log_every = int(getattr(model.args, "aux_log_every", 50))  # 50 step마다
+        self.aux_warn_ratio = float(getattr(model.args, "aux_warn_ratio", 0.5))
+        self.aux_log_csv = bool(getattr(model.args, "aux_log_csv", False))  # True면 CSV 저장
+        self._aux_step = 0
+        self._aux_csv_path = None
+
+        # ✅ epoch 통계 로깅
+        self.aux_epoch_log_every = int(getattr(model.args, "aux_epoch_log_every", 1))  # epoch마다 1회 요약
+        self._aux_epoch_stats = {
+            "epoch": None,
+            "n": 0,
+            "sum_ratio_raw": 0.0,
+            "sum_ratio_w": 0.0,
+            "max_ratio_raw": 0.0,
+            "max_ratio_w": 0.0,
+        }
+
+    def _is_rank0(self) -> bool:
+        return int(os.environ.get("RANK", "0")) == 0
+
+    def _t2f(self, x) -> float:
+        """tensor/float/int -> float로 안전 변환"""
+        if x is None:
+            return 0.0
+        if isinstance(x, (float, int)):
+            return float(x)
+        if torch.is_tensor(x):
+            return float(x.detach().item()) if x.numel() == 1 else float(x.detach().mean().item())
+        return float(x)
+
+    def _init_csv(self):
+        if self._aux_csv_path is not None:
+            return
+        save_dir = getattr(self.model, "save_dir", None)
+        if save_dir is None:
+            save_dir = os.getcwd()
+        self._aux_csv_path = os.path.join(str(save_dir), "aux_loss_log.csv")
+
+        # ✅ 헤더: ratio_raw/ratio_w + tag 추가
+        if not os.path.exists(self._aux_csv_path):
+            with open(self._aux_csv_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "time,step,epoch,det,aux_raw,aux_w,aux_weighted,"
+                    "ratio_raw,ratio_w,lambda_ent,lambda_bal,noise,tag\n"
+                )
+
+    def _flush_epoch_summary_if_needed(self, next_epoch: int):
+        """epoch 변경 시 직전 epoch 요약 1회 출력/CSV 기록"""
+        st = self._aux_epoch_stats
+        prev_epoch = st["epoch"]
+        if prev_epoch is None:
+            st["epoch"] = next_epoch
+            return
+
+        # epoch이 안 바뀌었으면 아무 것도 안 함
+        if next_epoch == prev_epoch:
+            return
+
+        # prev_epoch 요약 출력
+        if self._is_rank0() and (prev_epoch % self.aux_epoch_log_every == 0) and st["n"] > 0:
+            mean_raw = st["sum_ratio_raw"] / st["n"]
+            mean_w = st["sum_ratio_w"] / st["n"]
+
+            print(
+                f"[AUX/EPOCH] epoch={prev_epoch} "
+                f"ratio_raw_mean={mean_raw:.3e} ratio_raw_max={st['max_ratio_raw']:.3e} "
+                f"ratio_w_mean={mean_w:.3e} ratio_w_max={st['max_ratio_w']:.3e} "
+                f"n={st['n']}"
+            )
+
+            if self.aux_log_csv:
+                self._init_csv()
+                with open(self._aux_csv_path, "a", encoding="utf-8") as f:
+                    # epoch summary 행: det/aux 등은 비워두고 ratio_mean/max를 det 자리에 쓰지 않도록 빈칸 유지
+                    f.write(
+                        f"{time.time():.3f},-1,{prev_epoch},"
+                        f",,,,"
+                        f"{mean_raw:.8e},{mean_w:.8e},"
+                        f",,,epoch_summary\n"
+                    )
+
+        # stats reset for new epoch
+        st["epoch"] = next_epoch
+        st["n"] = 0
+        st["sum_ratio_raw"] = 0.0
+        st["sum_ratio_w"] = 0.0
+        st["max_ratio_raw"] = 0.0
+        st["max_ratio_w"] = 0.0
 
     def __call__(self, preds, batch):
         det_vec, loss_items = super().__call__(preds, batch)
@@ -327,6 +413,13 @@ class MoEDetectionLoss(v8DetectionLoss):
         aux_loss_weight = getattr(head, "aux_loss_weight", None)
         if aux_loss_weight is None:
             aux_loss_weight = 0.0
+        aux_w = float(aux_loss_weight)
+
+        # ---- 스케줄 값들도 같이 기록 ----
+        lam_ent = getattr(head, "lambda_entropy", None)
+        lam_bal = getattr(head, "lambda_balance", None)
+        noise   = getattr(head, "noise_scale", None)
+
         # ---------------------------
         # 1) MoE aux loss
         # ---------------------------
@@ -334,26 +427,75 @@ class MoEDetectionLoss(v8DetectionLoss):
         if self.model.training:
             aux_loss = MOE_CONTEXT.pop("aux_loss", None)
 
-        if aux_loss is not None:
-            ratio = aux_loss.abs() / (det_loss.detach() + 1e-6)
-            if ratio > 0.5:
-                print(f"[WARN] aux_loss dominates det_loss: ratio={ratio:.2f}")
+        # epoch 가져오기 (가능한 한 정확히)
+        epoch = getattr(getattr(self.model, "trainer", None), "epoch", None)
+        if epoch is None:
+            epoch = getattr(self.model, "_epoch", -1)
 
+        # ✅ epoch summary flush(=epoch가 바뀌면 직전 요약 1회 출력)
+        if self.model.training:
+            self._flush_epoch_summary_if_needed(int(epoch))
 
-        if aux_loss is not None and aux_loss_weight != 0:
-            total_loss = total_loss + aux_loss_weight * aux_loss
-        elif aux_loss_weight == 0:
-            print("[MoEDetectionLoss] aux_loss_weight is 0")
-            # print(f"total_loss {total_loss} = total_loss {total_loss} + self.aux_loss_weight {self.aux_loss_weight} * aux_loss {aux_loss}")
+        # float 변환
+        det_f = self._t2f(det_loss)
+        aux_raw_f = self._t2f(aux_loss) if aux_loss is not None else 0.0
+        aux_weighted_f = aux_w * aux_raw_f
+
+        # ✅ ratio 두 개
+        ratio_raw = abs(aux_raw_f) / (det_f + 1e-6)         # 기존 ratio_f
+        ratio_w   = abs(aux_weighted_f) / (det_f + 1e-6)    # 실제 total_loss 기여 비율
+
+        # ✅ epoch stats 누적
+        if self.model.training:
+            st = self._aux_epoch_stats
+            # epoch=-1 같은 경우에도 누적은 하되, 의미는 낮음(그래도 패턴 확인 가능)
+            st["n"] += 1
+            st["sum_ratio_raw"] += ratio_raw
+            st["sum_ratio_w"] += ratio_w
+            st["max_ratio_raw"] = max(st["max_ratio_raw"], ratio_raw)
+            st["max_ratio_w"] = max(st["max_ratio_w"], ratio_w)
+
+        # 경고: raw 기준(너가 보던 스케일 유지)
+        if aux_loss is not None and ratio_raw > self.aux_warn_ratio and self._is_rank0():
+            print(
+                f"[WARN] aux_loss dominates det_loss: "
+                f"ratio_raw={ratio_raw:.3f} (aux_raw={aux_raw_f:.6f}, det={det_f:.6f})"
+            )
+
+        # step 로깅
+        if self.model.training and self._is_rank0() and (self._aux_step % self.aux_log_every == 0):
+            print(
+                f"[AUX] step={self._aux_step} epoch={epoch} "
+                f"det={det_f:.6f} aux_raw={aux_raw_f:.6f} aux_w={aux_w:.3f} aux_weighted={aux_weighted_f:.6f} "
+                f"ratio_raw={ratio_raw:.3e} ratio_w={ratio_w:.3e} "
+                f"(lam_ent={lam_ent}, lam_bal={lam_bal}, noise={noise})"
+            )
+
+            if self.aux_log_csv:
+                self._init_csv()
+                with open(self._aux_csv_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{time.time():.3f},{self._aux_step},{epoch},"
+                        f"{det_f:.8f},{aux_raw_f:.8f},{aux_w:.6f},{aux_weighted_f:.8f},"
+                        f"{ratio_raw:.8e},{ratio_w:.8e},"
+                        f"{self._t2f(lam_ent) if lam_ent is not None else ''},"
+                        f"{self._t2f(lam_bal) if lam_bal is not None else ''},"
+                        f"{self._t2f(noise) if noise is not None else ''},"
+                        f"step\n"
+                    )
+
+        # loss 합치기
+        if aux_loss is not None and aux_w != 0.0:
+            total_loss = total_loss + aux_w * aux_loss
+        elif aux_w == 0.0 and self.model.training and self._is_rank0() and (self._aux_step % self.aux_log_every == 0):
+            print("[MoEDetectionLoss] aux_loss_weight is 0 (aux branch disabled)")
+
+        self._aux_step += 1
 
         # ---------------------------
         # 2) (optional) KD loss
         # ---------------------------
-        if (
-            self.model.training
-            and self.teacher is not None
-            and self.kd_weight > 0
-        ):
+        if self.model.training and self.teacher is not None and self.kd_weight > 0:
             kd_loss = self._compute_kd_loss(preds, batch)
             if kd_loss is not None:
                 total_loss = total_loss + self.kd_weight * kd_loss

@@ -24,6 +24,7 @@ class MoEParams:
     lambda_balance: float = 1.0
 
     noise_scale: float = 0.01
+    gumbel_scale: float = 0.0
 
     # 랜덤 샘플링 모드 여부
     random: bool = False

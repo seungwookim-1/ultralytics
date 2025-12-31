@@ -105,11 +105,18 @@ class MoETrainer(DetectionTrainer):
         head.lambda_balance = float(params.lambda_balance)
         head.noise_scale = float(params.noise_scale)
         head.aux_loss_weight = float(params.aux_loss_weight)
+        head.gumbel_scale = float(getattr(params, "gumbel_scale", 0.0))
+
+        if hasattr(head, "routers"):
+            for router in head.routers:
+                if hasattr(router, "set_gumbel_scale"):
+                    router.set_gumbel_scale(head.gumbel_scale)
 
         print("[MoETrainer] applied:",
               "lambda_entropy", head.lambda_entropy,
               "lambda_balance", head.lambda_balance,
               "noise_scale", head.noise_scale,
+              "gumbel_scale", head.gumbel_scale,
               "aux_loss_weight", head.aux_loss_weight,
         )
 
@@ -140,7 +147,8 @@ class MoETrainer(DetectionTrainer):
         # ---- base values ----
         base_entropy = float(params.lambda_entropy)
         base_balance = float(params.lambda_balance)
-        base_noise   = float(params.noise_scale)
+        # base_noise   = float(params.noise_scale)
+        base_gumbel = float(params.gumbel_scale)
         base_aux     = float(params.aux_loss_weight)
 
         def mult(key: str, default_min: float, default_max: float) -> float:
@@ -153,33 +161,46 @@ class MoETrainer(DetectionTrainer):
             return m_min + (m_max - m_min) * s
 
         def mult_peak(key: str, default_min: float, default_max: float,
-                    mu: float = 0.48, sigma: float = 0.10, peak_gain: float = 0.0) -> float:
+                mu: float = 0.48, sigma: float = 0.10, peak_gain: float = 0.0) -> float:    
+            cfg = sched.get(key, None)
+            if cfg is not None:
+                mu = float(cfg.get("mu", mu))
+                sigma = float(cfg.get("sigma", sigma))
+                peak_gain = float(cfg.get("peak_gain", peak_gain))
             m = mult(key, default_min, default_max)        # cos 기반(전체 1->0)
             pk = peak(p, mu=mu, sigma=sigma)               # 중반만 0~1
             return m * (1.0 + peak_gain * pk)
 
         # ---- per-param multipliers (단일 파라미터만 실험하려면 나머지 m_min=m_max=1로 두면 됨) ----
         m_ent = mult("lambda_entropy", default_min=1.0, default_max=1.0)
-        m_bal = mult("lambda_balance", default_min=0.30, default_max=1.3)
-        m_ns  = mult_peak("noise_scale",
-                default_min=0.08, default_max=2.0,
-                mu=0.48, sigma=0.10, peak_gain=1.0)
+        m_bal = mult("lambda_balance", default_min=1.0, default_max=1.0)
+        # m_bal = mult("lambda_balance", default_min=0.30, default_max=1.3)
+        # m_ns  = mult_peak("noise_scale",
+        #         default_min=0.08, default_max=2.0,
+        #         mu=0.48, sigma=0.10, peak_gain=1.0)
+        #m_ns = mult("noise_scale", default_min=0.08, default_max=2.0)
+        # m_ns = mult("noise_scale", default_min=1.0, default_max=1.0)
+
+        # m_gumbel = mult("gumbel_scale", default_min=1.0, default_max=1.0)
+        m_gumbel = mult_peak("gumbel_scale", default_min=1.0, default_max=1.0, mu=0.48, sigma=0.10, peak_gain=1.0)             # 추천: 0.5~2.0 sweep
+
         # aux는 우선 고정 권장. 스케줄 실험하고 싶으면 아래처럼:
         m_aux = mult("aux_loss_weight", default_min=1.0, default_max=1.0)
 
         head.lambda_entropy = base_entropy * m_ent
         head.lambda_balance = base_balance * m_bal
-        head.noise_scale    = base_noise   * m_ns
+        # head.noise_scale    = base_noise   * m_ns
+        head.gumbel_scale = base_gumbel * m_gumbel
         head.aux_loss_weight = base_aux * m_aux
 
         # ---- temperature schedule ----
         # base T=1.0 기준. 필요하면 sched["temperature"]로 제어
         t_cfg = sched.get("temperature", {})
         T_min = float(t_cfg.get("min", 1.0))
-        T_max = float(t_cfg.get("max", 1.5))
+        T_max = float(t_cfg.get("max", 1.0))
         T = T_min + (T_max - T_min) * s
 
-        T_peak_gain = float(t_cfg.get("peak_gain", 0.4))   # 0.3~0.6 권장
+        T_peak_gain = float(t_cfg.get("peak_gain", 0.0))   # 0.3~0.6 권장
         T *= (1.0 + T_peak_gain * peak(p, mu=0.48, sigma=0.10))
 
         if not hasattr(head, "routers"):
@@ -188,6 +209,9 @@ class MoETrainer(DetectionTrainer):
         for router in head.routers:
             if hasattr(router, "set_temperature"):
                 router.set_temperature(T)
+            if hasattr(router, "set_gumbel_scale"):
+                router.set_gumbel_scale(head.gumbel_scale)
+        print(f"[schedule] ent: {head.lambda_entropy:.4f}, bal: {head.lambda_balance:.4f}, aux={head.aux_loss_weight:.4f}, gum={head.gumbel_scale:.4f}, gum_router_0={head.routers[0].gumbel_scale:.4f}, temp = {T}")
 
     def preprocess_batch(self, batch):
         batch = super().preprocess_batch(batch)

@@ -1204,11 +1204,12 @@ class LinearRouter(nn.Module):
         routing_logits:   [B, E]
     """
 
-    def __init__(self, in_channels: int, num_experts: int, temperature: float = 1.0, noise_scale: float = 0.01):
+    def __init__(self, in_channels: int, num_experts: int, temperature: float = 1.0, gumbel_scale: float = 0.0):
         super().__init__()
         self.num_experts = num_experts
         self.temperature = float(temperature)
-        self.noise_scale = float(noise_scale)
+        # self.noise_scale = float(noise_scale)
+        self.gumbel_scale = float(gumbel_scale)
         self.conv = nn.Conv2d(in_channels, num_experts, kernel_size=1, bias=True)
 
     @torch.no_grad()
@@ -1216,8 +1217,16 @@ class LinearRouter(nn.Module):
         self.temperature = float(temperature)
 
     @torch.no_grad()
-    def set_noise_scale(self, noise_scale: float) -> None:
-        self.noise_scale = float(noise_scale)
+    def set_gumbel_scale(self, gumbel_scale: float) -> None:
+        self.gumbel_scale = float(gumbel_scale)
+
+    # @torch.no_grad()
+    # def set_noise_scale(self, noise_scale: float) -> None:
+    #     self.noise_scale = float(noise_scale)
+    @staticmethod   
+    def sample_gumbel(shape, device, eps=1e-20):
+        U = torch.rand(shape, device=device)
+        return -torch.log(-torch.log(U + eps) + eps)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1231,6 +1240,14 @@ class LinearRouter(nn.Module):
         logits = self.conv(x)                     # [B, E, H, W]
         logits_mean = logits.mean(dim=(2, 3))     # [B, E]
         routing_logits = logits_mean / max(self.temperature, 1e-6)
+
+        if self.training and self.gumbel_scale > 0:
+            gumbel_noise = self.sample_gumbel(
+                routing_logits.shape,
+                device=routing_logits.device,
+            )
+            routing_logits = routing_logits + self.gumbel_scale * gumbel_noise
+        # routing_logits += self.noise_scale * torch.randn_like(routing_logits)
         routing_weights = F.softmax(routing_logits, dim=-1)  # [B, E]
         return routing_weights, routing_logits
 
@@ -1372,55 +1389,42 @@ class MoEDetect(Detect):
 
     @torch.no_grad()
     def init_from_detect(self, detect_head: Detect, noise_scale: float) -> None:
-        """
-        기존 Detect head로부터 expert 0의 가중치를 복사하고,
-        나머지 expert에는 약간의 노이즈를 추가해 초기화.
-
-        Args:
-            detect_head: 기존 YOLO Detect head (base model에서 가져옴)
-            noise_scale: expert 분화를 위한 가우시안 노이즈 스케일
-        """
         assert isinstance(detect_head, Detect)
         assert detect_head.nl == self.nl
 
-        # noise_scale = getattr(self, "noise_scale", 0.01)
         print(f"[MoE init] noise_scale={float(noise_scale):.5f}")
-        #     f"lambda_entropy={getattr(self, 'lambda_entropy', None)}, "
-        #     f"lambda_balance={getattr(self, 'lambda_balance', None)}")
 
-        if detect_head.nc != self.nc:
-            print(
-                f"[MoE init] WARNING: detect_head.nc={detect_head.nc}, moe.nc={self.nc} → "
-                f"cls 브랜치는 랜덤 초기화로 유지"
-            )
-            copy_cls = False
-        else:
-            copy_cls = True
+        copy_cls = (detect_head.nc == self.nc)
+        if not copy_cls:
+            print(f"[MoE init] WARNING: detect_head.nc={detect_head.nc}, moe.nc={self.nc} → cls 랜덤 유지")
 
         for i in range(self.nl):
-            base_reg = detect_head.cv2[i]  # bbox branch
-            base_cls = detect_head.cv3[i]  # cls  branch
+            base_reg = detect_head.cv2[i]
+            base_cls = detect_head.cv3[i]
 
-            for e in range(self.num_experts):
+            # ---- 1) expert0에만 base weight 로드 ----
+            ex0 = self.experts[i][0]
+            ex0.cv2.load_state_dict(base_reg.state_dict())
+
+            if copy_cls:
+                ex_cv3_sd = ex0.cv3.state_dict()
+                base_cv3_sd = base_cls.state_dict()
+                merged = {k: v for k, v in base_cv3_sd.items()
+                        if k in ex_cv3_sd and ex_cv3_sd[k].shape == v.shape}
+                ex0.cv3.load_state_dict({**ex_cv3_sd, **merged})
+
+            # ---- 2) 나머지 expert는 expert0 복제 후 노이즈 ----
+            for e in range(1, self.num_experts):
                 ex = self.experts[i][e]
+                ex.load_state_dict(ex0.state_dict(), strict=True)
 
-                # 1) bbox branch는 shape가 같으면 그대로 복사
-                ex.cv2.load_state_dict(base_reg.state_dict())
-
-                # 2) cls branch는 shape 맞는 것만 selective copy
-                if copy_cls:
-                    ex_cv3_sd = ex.cv3.state_dict()
-                    base_cv3_sd = base_cls.state_dict()
-                    merged = {}
-                    for k, v in base_cv3_sd.items():
-                        if k in ex_cv3_sd and ex_cv3_sd[k].shape == v.shape:
-                            merged[k] = v
-                    ex.cv3.load_state_dict({**ex_cv3_sd, **merged})
-
-                # 3) expert > 0에는 작은 노이즈 추가
-                if e > 0 and noise_scale > 0:
-                    for p in ex.parameters():
-                        p.add_(noise_scale * torch.randn_like(p))
+                if noise_scale > 0:
+                    for m in ex.modules():
+                        # conv만 perturb (BN/others skip)
+                        if isinstance(m, torch.nn.Conv2d):
+                            m.weight.add_(noise_scale * torch.randn_like(m.weight))
+                            if m.bias is not None:
+                                m.bias.add_(noise_scale * torch.randn_like(m.bias))
 
     def _compute_load_balance_loss(
         self,

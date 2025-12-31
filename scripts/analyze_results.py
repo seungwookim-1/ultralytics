@@ -273,7 +273,7 @@ def run_analysis(results_root, analysis_root):
             schedule_param = None
             schedule_min = None
             schedule_max = None
-            for k in ("lambda_balance", "lambda_entropy", "noise_scale"):
+            for k in ("lambda_balance", "lambda_entropy", "gumbel_scale"):
                 if k in schedule:
                     cfg = schedule[k]
                     if cfg.get("m_min") != 1.0 or cfg.get("m_max") != 1.0:
@@ -449,7 +449,7 @@ def run_analysis(results_root, analysis_root):
 
 if __name__ == "__main__":
     default_analysis_root = Path(
-        "/ultralytics/outputs/aux_weight_test_1"
+        "/ultralytics/outputs/scheduling_test_cosine_with_peak_debug"
     )
     default_results_root = default_analysis_root / "results"
     run_analysis(default_results_root, default_analysis_root)
