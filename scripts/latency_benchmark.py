@@ -38,9 +38,9 @@ def benchmark_latency(model: YOLO, imgsz=640, runs=100):
 
 if __name__ == "__main__":
     model_pairs = [
-        ("YOLOn", "/ultralytics/runs/multi_11n_11s_moe/YOLOn_multi_s0/weights/best.pt"),
-        ("MoE", "/ultralytics/runs/multi_11n_11s_moe/MoE_multi_s0/weights/best.pt"),
-        ("YOLOs", "/ultralytics/runs/multi_11n_11s_moe/YOLOs_multi_s0/weights/best.pt"),
+        ("YOLOn", "/ultralytics/outputs/scheduling_top_k_2_test_1/results/YOLOn_multi_s11/weights/best.pt"),
+        ("MoE", "/ultralytics/outputs/scheduling_top_k_2_test_1/results/MoE_multi_BAL2.00_ENT0.08_AUX0.030_NS0.015_SCHED_lambda_balance_min0.85_max1.30_s11/weights/best.pt"),
+        # ("YOLOs", "/ultralytics/runs/multi_11n_11s_moe/YOLOs_multi_s0/weights/best.pt"),
     ]
     for model, weight in model_pairs:
         print(f"{model} latency: {benchmark_latency(YOLO(weight))} ms/img")

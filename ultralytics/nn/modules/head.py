@@ -1347,20 +1347,42 @@ class MoEDetect(Detect):
             router_info.append((weights, logits))
 
             # 2) expert forward
+            # box_list = []
+            # cls_list = []
+            # for e in range(E):
+            #     box_e, cls_e = self.experts[i][e](feat)   # [B, 4*reg_max, H, W], [B, nc, H, W]
+            #     box_list.append(box_e.unsqueeze(1))       # [B, 1, 4*reg_max, H, W]
+            #     cls_list.append(cls_e.unsqueeze(1))       # [B, 1, nc, H, W]
+
+            # box_stack = torch.cat(box_list, dim=1)        # [B, E, 4*reg_max, H, W]
+            # cls_stack = torch.cat(cls_list, dim=1)        # [B, E, nc, H, W]
+
+            # # 3) soft routing mixture
+            # w = weights.view(B, E, 1, 1, 1)               # [B, E, 1, 1, 1]
+            # box_mixed = (box_stack * w).sum(dim=1)        # [B, 4*reg_max, H, W]
+            # cls_mixed = (cls_stack * w).sum(dim=1)        # [B, nc, H, W]
+
+            topk = 2
+            w_mean = weights.mean(dim=0)                 # [E]
+            top_idx = torch.topk(w_mean, k=topk, dim=0).indices  # [2]
+
             box_list = []
             cls_list = []
-            for e in range(E):
+            for e in top_idx.tolist():
                 box_e, cls_e = self.experts[i][e](feat)   # [B, 4*reg_max, H, W], [B, nc, H, W]
                 box_list.append(box_e.unsqueeze(1))       # [B, 1, 4*reg_max, H, W]
                 cls_list.append(cls_e.unsqueeze(1))       # [B, 1, nc, H, W]
 
-            box_stack = torch.cat(box_list, dim=1)        # [B, E, 4*reg_max, H, W]
-            cls_stack = torch.cat(cls_list, dim=1)        # [B, E, nc, H, W]
+            box_stack = torch.cat(box_list, dim=1)        # [B, 2, 4*reg_max, H, W]
+            cls_stack = torch.cat(cls_list, dim=1)        # [B, 2, nc, H, W]
 
-            # 3) soft routing mixture
-            w = weights.view(B, E, 1, 1, 1)               # [B, E, 1, 1, 1]
-            box_mixed = (box_stack * w).sum(dim=1)        # [B, 4*reg_max, H, W]
-            cls_mixed = (cls_stack * w).sum(dim=1)        # [B, nc, H, W]
+            # top-2 weights만 추출 후 renorm
+            w_top = weights[:, top_idx]                   # [B, 2]
+            w_top = w_top / (w_top.sum(dim=1, keepdim=True) + 1e-12)  # renorm
+            w = w_top.view(B, topk, 1, 1, 1)
+
+            box_mixed = (box_stack * w).sum(dim=1)
+            cls_mixed = (cls_stack * w).sum(dim=1)
 
             out_i = torch.cat([box_mixed, cls_mixed], dim=1)  # [B, no, H, W]
             outputs.append(out_i)

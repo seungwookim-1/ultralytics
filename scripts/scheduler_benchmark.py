@@ -22,16 +22,16 @@ from random_param_search import MoEParams
 
 fixed_params_list = [
     {"aux_loss_weight": 0.03, "lambda_entropy": 0.08, "lambda_balance": 2.0, "noise_scale": 0.015, "gumbel_scale": 0.6},
-    {"aux_loss_weight": 0.01, "lambda_entropy": 0.08, "lambda_balance": 2.0, "noise_scale": 0.015, "gumbel_scale": 0.6},
+    # {"aux_loss_weight": 0.01, "lambda_entropy": 0.08, "lambda_balance": 2.0, "noise_scale": 0.015, "gumbel_scale": 0.6},
 ]
 
 single_param_plan = [
-    ("gumbel_scale", {"m_min": 0.0, "grid": [0.2, 0.4, 0.6]}),
+    ("gumbel_scale", {"m_min": 0.0, "grid": [0.4]}),
     # balance: 후반 바닥(m_min)을 올리는 게 collapse 방지에 핵심
     ("lambda_balance", {"m_max": 1.3, "grid": [0.55, 0.70, 0.85]}),
 
     # # entropy: 너무 크게 흔들 필요는 없고, 후반 잔여량(m_min)만 조금씩
-    ("lambda_entropy", {"m_max": 1.3, "grid": [0.16, 0.22]}),
+    ("lambda_entropy", {"m_max": 1.3, "grid": [0.22]}),
 
     # noise: 초반 탐색(m_max)이 더 중요할 때가 많음 → 여기선 m_max를 grid로 돌리고 m_min은 고정
     # 구현상 통일을 위해 m_min=0.08 고정, m_max를 grid로
@@ -40,7 +40,7 @@ single_param_plan = [
 
 def create_project_config() -> ProjectConfig:
     cfg =  ProjectConfig(
-        name="scheduling_test_cosine_noise_gumbel_peak_1",
+        name="scheduling_top_k_2_test_1",
         # name="scheduling_test_cosine_with_peak_temp_max_1.7",
         seed_list=[11],
         random_trial_counts=20,
@@ -53,7 +53,7 @@ def create_project_config() -> ProjectConfig:
         param_mode="SCHEDULE",
         # dataset_mode="DEBUG",
         # param_mode="FIXED",
-        max_train=3000,
+        max_train=1000,
         val_ratio=0.1,
         epochs=30,
         run_analysis=True,
