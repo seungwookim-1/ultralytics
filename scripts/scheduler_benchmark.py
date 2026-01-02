@@ -28,7 +28,7 @@ fixed_params_list = [
 single_param_plan = [
     ("gumbel_scale", {"m_min": 0.0, "grid": [0.4]}),
     # balance: 후반 바닥(m_min)을 올리는 게 collapse 방지에 핵심
-    ("lambda_balance", {"m_max": 1.3, "grid": [0.55, 0.70, 0.85]}),
+    ("lambda_balance", {"m_max": 1.3, "grid": [0.85]}),
 
     # # entropy: 너무 크게 흔들 필요는 없고, 후반 잔여량(m_min)만 조금씩
     ("lambda_entropy", {"m_max": 1.3, "grid": [0.22]}),
@@ -38,22 +38,34 @@ single_param_plan = [
     # ("noise_scale", {"m_min": 0.08, "grid": [1.6, 2.2]}),
 ]
 
+combo_plan = [
+    ("B0.85_E0.22_G0.40", {
+        "lambda_balance": {"m_min": 0.85, "m_max": 1.30},
+        "lambda_entropy": {"m_min": 0.22, "m_max": 1.30},
+        "gumbel_scale":   {"m_min": 0.0,  "m_max": 0.40, "mu":0.48, "sigma":0.10, "peak_gain":1.0},
+        # aux는 고정 유지 권장
+        "aux_loss_weight": {"m_min": 1.0, "m_max": 1.0},
+        # temp는 필요 시만 (top-2면 우선 꺼도 됨)
+        "temperature": {"min": 1.0, "max": 1.5, "peak_gain": 0.0},
+    }),
+]
+
+
 def create_project_config() -> ProjectConfig:
     cfg =  ProjectConfig(
-        name="scheduling_top_k_2_test_1",
-        # name="scheduling_test_cosine_with_peak_temp_max_1.7",
-        seed_list=[11],
+        name="scheduling_combo_test_1",
+        seed_list=[11, 21, 47, 121],
         random_trial_counts=20,
         loader_pairs = [
             ("multi", sd_symlink_config_loader),
             # ("nonmoving", sd_symlink_config_loader_n),
             # ("rider", sd_symlink_config_loader_r),
             ],
-        dataset_mode="DEBUG",
+        dataset_mode="TRAIN",
         param_mode="SCHEDULE",
         # dataset_mode="DEBUG",
         # param_mode="FIXED",
-        max_train=1000,
+        max_train=3000,
         val_ratio=0.1,
         epochs=30,
         run_analysis=True,
@@ -313,6 +325,32 @@ def make_schedule_single_param(
     sched[which] = {"m_min": float(m_min), "m_max": float(m_max)}
     return sched
 
+def make_schedule_combo(tag: str, spec: dict, *, temp_min=1.0, temp_max=1.5) -> dict:
+    """
+    spec 예시:
+      {
+        "lambda_balance": {"m_min": 0.85, "m_max": 1.30},
+        "lambda_entropy": {"m_min": 0.22, "m_max": 1.30},
+        "gumbel_scale":   {"m_min": 0.0,  "m_max": 0.40, "mu":0.48, "sigma":0.10, "peak_gain":1.0},
+        # "aux_loss_weight": {"m_min": 1.0, "m_max": 1.0},  # 보통 고정
+        # "temperature": {"min":1.0, "max":1.5, "peak_gain":0.0},
+      }
+    """
+    sched = {
+        "tag": f"SCHED_COMBO_{tag}",
+        # 기본값(없으면 trainer에서 mult() default_min/max=1.0로 처리됨)
+        "lambda_balance": {"m_min": 1.0, "m_max": 1.0},
+        "lambda_entropy": {"m_min": 1.0, "m_max": 1.0},
+        "gumbel_scale":   {"m_min": 1.0, "m_max": 1.0},  # trainer가 mult_peak로 읽을 것
+        "aux_loss_weight": {"m_min": 1.0, "m_max": 1.0},
+        "temperature": {"min": temp_min, "max": temp_max, "peak_gain": 0.0},
+    }
+
+    # 덮어쓰기
+    for k, v in spec.items():
+        sched[k] = v
+    return sched
+
 def run_param_schedule_list(cfg: ProjectConfig):
     for search_seed in cfg.seed_list:
         for param_set in fixed_params_list:
@@ -323,88 +361,116 @@ def run_param_schedule_list(cfg: ProjectConfig):
                 noise_scale = param_set["noise_scale"],
                 gumbel_scale = param_set["gumbel_scale"]
                 )
-                    
+            # for which, spec in single_param_plan:
+            #     # 케이스 1) m_min을 grid로 돌리는 타입(balance, entropy)
+            #     if "m_max" in spec:
+            #         m_max = float(spec["m_max"])
+            #         for m_min in spec["grid"]:
+            #             schedule_cfg = make_schedule_single_param(
+            #                 which=which,
+            #                 m_min=float(m_min),
+            #                 m_max=m_max,
+            #                 temp_min=1.0,
+            #                 temp_max=1.5,
+            #             )
 
-            for which, spec in single_param_plan:
-                # 케이스 1) m_min을 grid로 돌리는 타입(balance, entropy)
-                if "m_max" in spec:
-                    m_max = float(spec["m_max"])
-                    for m_min in spec["grid"]:
-                        schedule_cfg = make_schedule_single_param(
-                            which=which,
-                            m_min=float(m_min),
-                            m_max=m_max,
-                            temp_min=1.0,
-                            temp_max=1.5,
-                        )
+            #             for domain_name, loader in cfg.loader_pairs:
+            #                 register_symlink_config_loader(loader)
 
-                        for domain_name, loader in cfg.loader_pairs:
-                            register_symlink_config_loader(loader)
+            #                 if cfg.dataset_mode == "TRAIN":
+            #                     dataset_config_path = create_dataset_config(
+            #                         cfg.val_ratio, seed=search_seed,
+            #                         max_train=cfg.max_train, max_val=cfg.max_val
+            #                     )
+            #                 else:
+            #                     dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
 
-                            if cfg.dataset_mode == "TRAIN":
-                                dataset_config_path = create_dataset_config(
-                                    cfg.val_ratio, seed=search_seed,
-                                    max_train=cfg.max_train, max_val=cfg.max_val
-                                )
-                            else:
-                                dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
+            #                 base_run_dir = cfg.results_root / f"YOLOn_{domain_name}_s{search_seed}"
+            #                 skip_baseline = (base_run_dir / "results.csv").exists()
 
-                            base_run_dir = cfg.results_root / f"YOLOn_{domain_name}_s{search_seed}"
-                            skip_baseline = (base_run_dir / "results.csv").exists()
-
-                            run_benchmark(
-                                cfg=cfg,
-                                moe_params=moe_params,
-                                schedule_cfg=schedule_cfg,   # ✅ 전달
-                                seed=search_seed,
-                                trial_idx=None,
-                                skip_baseline=skip_baseline,
-                                dataset_path=dataset_config_path,
-                                domain_name=domain_name,
-                            )
-                            gc.collect()
-                            torch.cuda.empty_cache()
-                            time.sleep(2)
+            #                 run_benchmark(
+            #                     cfg=cfg,
+            #                     moe_params=moe_params,
+            #                     schedule_cfg=schedule_cfg,   # ✅ 전달
+            #                     seed=search_seed,
+            #                     trial_idx=None,
+            #                     skip_baseline=skip_baseline,
+            #                     dataset_path=dataset_config_path,
+            #                     domain_name=domain_name,
+            #                 )
+            #                 gc.collect()
+            #                 torch.cuda.empty_cache()
+            #                 time.sleep(2)
 
                 # 케이스 2) m_max를 grid로 돌리는 타입(noise)
-                else:
-                    m_min = float(spec["m_min"])
-                    for m_max in spec["grid"]:
-                        schedule_cfg = make_schedule_single_param(
-                            which=which,
-                            m_min=m_min,
-                            m_max=float(m_max),
-                            temp_min=1.0,
-                            temp_max=1.5,
+                # else:
+                #     m_min = float(spec["m_min"])
+                #     for m_max in spec["grid"]:
+                #         schedule_cfg = make_schedule_single_param(
+                #             which=which,
+                #             m_min=m_min,
+                #             m_max=float(m_max),
+                #             temp_min=1.0,
+                #             temp_max=1.5,
+                #         )
+
+                #         for domain_name, loader in cfg.loader_pairs:
+                #             register_symlink_config_loader(loader)
+
+                #             if cfg.dataset_mode == "TRAIN":
+                #                 dataset_config_path = create_dataset_config(
+                #                     cfg.val_ratio, seed=search_seed,
+                #                     max_train=cfg.max_train, max_val=cfg.max_val
+                #                 )
+                #             else:
+                #                 dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
+
+                #             base_run_dir = cfg.results_root / f"YOLOn_{domain_name}_s{search_seed}"
+                #             skip_baseline = (base_run_dir / "results.csv").exists()
+
+                #             run_benchmark(
+                #                 cfg=cfg,
+                #                 moe_params=moe_params,
+                #                 schedule_cfg=schedule_cfg,   # ✅ 전달
+                #                 seed=search_seed,
+                #                 trial_idx=None,
+                #                 skip_baseline=skip_baseline,
+                #                 dataset_path=dataset_config_path,
+                #                 domain_name=domain_name,
+                #             )
+                #             gc.collect()
+                #             torch.cuda.empty_cache()
+                #             time.sleep(2)
+
+            for combo_tag, combo_spec in combo_plan:
+                schedule_cfg = make_schedule_combo(combo_tag, combo_spec, temp_min=1.0, temp_max=1.5)
+
+                for domain_name, loader in cfg.loader_pairs:
+                    register_symlink_config_loader(loader)
+                    if cfg.dataset_mode == "TRAIN":
+                        dataset_config_path = create_dataset_config(
+                            cfg.val_ratio, seed=search_seed,
+                            max_train=cfg.max_train, max_val=cfg.max_val
                         )
+                    else:
+                        dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
 
-                        for domain_name, loader in cfg.loader_pairs:
-                            register_symlink_config_loader(loader)
+                    base_run_dir = cfg.results_root / f"YOLOn_{domain_name}_s{search_seed}"
+                    skip_baseline = (base_run_dir / "results.csv").exists()
 
-                            if cfg.dataset_mode == "TRAIN":
-                                dataset_config_path = create_dataset_config(
-                                    cfg.val_ratio, seed=search_seed,
-                                    max_train=cfg.max_train, max_val=cfg.max_val
-                                )
-                            else:
-                                dataset_config_path = "/ultralytics/run/sd_moe/multihead_data.yaml"
-
-                            base_run_dir = cfg.results_root / f"YOLOn_{domain_name}_s{search_seed}"
-                            skip_baseline = (base_run_dir / "results.csv").exists()
-
-                            run_benchmark(
-                                cfg=cfg,
-                                moe_params=moe_params,
-                                schedule_cfg=schedule_cfg,   # ✅ 전달
-                                seed=search_seed,
-                                trial_idx=None,
-                                skip_baseline=skip_baseline,
-                                dataset_path=dataset_config_path,
-                                domain_name=domain_name,
-                            )
-                            gc.collect()
-                            torch.cuda.empty_cache()
-                            time.sleep(2)
+                    run_benchmark(
+                        cfg=cfg,
+                        moe_params=moe_params,
+                        schedule_cfg=schedule_cfg,
+                        seed=search_seed,
+                        trial_idx=None,
+                        skip_baseline=skip_baseline,
+                        dataset_path=dataset_config_path,
+                        domain_name=domain_name,
+                    )
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    time.sleep(2)
 
     if cfg.run_analysis:
         run_analysis(Path(cfg.results_root), Path(cfg.analysis_root))
