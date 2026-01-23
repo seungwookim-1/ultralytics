@@ -20,7 +20,20 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+MOE_CONTEXT = {}
+
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+    "MoEDetect",
+)
 
 
 class Detect(nn.Module):
@@ -1180,3 +1193,318 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
+
+
+class LinearRouter(nn.Module):
+    """
+    간단한 1x1 conv 기반 soft router.
+    - 입력: [B, C, H, W]
+    - 출력:
+        routing_weights: [B, E]  (이미지 단위, spatial 평균)
+        routing_logits:   [B, E]
+    """
+
+    def __init__(self, in_channels: int, num_experts: int, temperature: float = 1.0, gumbel_scale: float = 0.0):
+        super().__init__()
+        self.num_experts = num_experts
+        self.temperature = float(temperature)
+        # self.noise_scale = float(noise_scale)
+        self.gumbel_scale = float(gumbel_scale)
+        self.conv = nn.Conv2d(in_channels, num_experts, kernel_size=1, bias=True)
+
+    @torch.no_grad()
+    def set_temperature(self, temperature: float) -> None:
+        self.temperature = float(temperature)
+
+    @torch.no_grad()
+    def set_gumbel_scale(self, gumbel_scale: float) -> None:
+        self.gumbel_scale = float(gumbel_scale)
+
+    # @torch.no_grad()
+    # def set_noise_scale(self, noise_scale: float) -> None:
+    #     self.noise_scale = float(noise_scale)
+    @staticmethod   
+    def sample_gumbel(shape, device, eps=1e-20):
+        U = torch.rand(shape, device=device)
+        return -torch.log(-torch.log(U + eps) + eps)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, C, H, W]
+
+        Returns:
+            routing_weights: [B, E]
+            routing_logits:  [B, E]
+        """
+        logits = self.conv(x)                     # [B, E, H, W]
+        logits_mean = logits.mean(dim=(2, 3))     # [B, E]
+        routing_logits = logits_mean / max(self.temperature, 1e-6)
+
+        if self.training and self.gumbel_scale > 0:
+            gumbel_noise = self.sample_gumbel(
+                routing_logits.shape,
+                device=routing_logits.device,
+            )
+            routing_logits = routing_logits + self.gumbel_scale * gumbel_noise
+        # routing_logits += self.noise_scale * torch.randn_like(routing_logits)
+        routing_weights = F.softmax(routing_logits, dim=-1)  # [B, E]
+        return routing_weights, routing_logits
+
+
+class ExpertHead(nn.Module):
+    """MoE용 가벼운 expert detection head."""
+
+    def __init__(self, in_channels: int, nc: int, reg_max: int = 16):
+        """
+        Args:
+            in_channels: backbone feature 채널 수
+            nc: 클래스 개수
+            reg_max: DFL 채널 수
+        """
+        super().__init__()
+        c2 = max(16, in_channels // 4, reg_max * 4)
+        c3 = max(in_channels, min(nc, 100))
+
+        # box branch: [B, 4*reg_max, H, W]
+        self.cv2 = nn.Sequential(
+            Conv(in_channels, c2, 3),
+            Conv(c2, c2, 3),
+            nn.Conv2d(c2, 4 * reg_max, 1),
+        )
+
+        # cls branch: [B, nc, H, W]
+        self.cv3 = nn.Sequential(
+            nn.Sequential(DWConv(in_channels, in_channels, 3), Conv(in_channels, c3, 1)),
+            nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+            nn.Conv2d(c3, nc, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [B, C, H, W]
+
+        Returns:
+            box: [B, 4*reg_max, H, W]
+            cls: [B, nc, H, W]
+        """
+        return self.cv2(x), self.cv3(x)
+
+
+class MoEDetect(Detect):
+    """
+    Mixture-of-Experts YOLO detection head.
+
+    - backbone + neck는 기존 YOLO와 동일
+    - 마지막 Detect head만 MoE 구조로 치환
+    - EMA / Trainer 쪽 로직은 그대로 사용 가능하도록
+      forward 인터페이스를 Detect와 동일하게 유지
+    """
+
+    def __init__(self, nc: int = 80, ch: tuple = (), num_experts: int = 4):
+        super().__init__(nc=nc, ch=ch)
+
+        self.num_experts = num_experts
+
+        # Router: scale별 1개
+        self.routers = nn.ModuleList(
+            LinearRouter(c, num_experts) for c in ch
+        )
+
+        # Expert heads: [nl, num_experts]
+        self.experts = nn.ModuleList(
+            nn.ModuleList(ExpertHead(c, nc, self.reg_max) for _ in range(num_experts))
+            for c in ch
+        )
+
+        # 통계용 usage 카운트 (buffer로 등록 → EMA / deepcopy 안전)
+        self.register_buffer("expert_counts", torch.zeros(self.nl, num_experts))
+        self.register_buffer("expert_counts_nonmoving", torch.zeros(num_experts))
+        self.register_buffer("expert_counts_rider", torch.zeros(num_experts))
+
+        
+
+    def forward(self, x):
+        """
+        Args:
+            x: backbone에서 넘어온 feature list, 각 원소 [B, C_i, H_i, W_i]
+
+        Returns:
+            - train: list[Tensor], 각 [B, no, H_i, W_i]  (Detect와 동일)
+            - eval : (pred, x) or pred  (Detect._inference 사용)
+        """
+        outputs: list[torch.Tensor] = []
+        router_info: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        for i in range(self.nl):
+            feat = x[i]  # [B, C, H, W]
+            B, C, H, W = feat.shape
+            E = self.num_experts
+
+            # 1) router
+            weights, logits = self.routers[i](feat)  # [B, E]
+            router_info.append((weights, logits))
+
+            # 2) expert forward
+            # box_list = []
+            # cls_list = []
+            # for e in range(E):
+            #     box_e, cls_e = self.experts[i][e](feat)   # [B, 4*reg_max, H, W], [B, nc, H, W]
+            #     box_list.append(box_e.unsqueeze(1))       # [B, 1, 4*reg_max, H, W]
+            #     cls_list.append(cls_e.unsqueeze(1))       # [B, 1, nc, H, W]
+
+            # box_stack = torch.cat(box_list, dim=1)        # [B, E, 4*reg_max, H, W]
+            # cls_stack = torch.cat(cls_list, dim=1)        # [B, E, nc, H, W]
+
+            # # 3) soft routing mixture
+            # w = weights.view(B, E, 1, 1, 1)               # [B, E, 1, 1, 1]
+            # box_mixed = (box_stack * w).sum(dim=1)        # [B, 4*reg_max, H, W]
+            # cls_mixed = (cls_stack * w).sum(dim=1)        # [B, nc, H, W]
+
+            topk = 2
+            w_mean = weights.mean(dim=0)                 # [E]
+            top_idx = torch.topk(w_mean, k=topk, dim=0).indices  # [2]
+
+            box_list = []
+            cls_list = []
+            for e in top_idx.tolist():
+                box_e, cls_e = self.experts[i][e](feat)   # [B, 4*reg_max, H, W], [B, nc, H, W]
+                box_list.append(box_e.unsqueeze(1))       # [B, 1, 4*reg_max, H, W]
+                cls_list.append(cls_e.unsqueeze(1))       # [B, 1, nc, H, W]
+
+            box_stack = torch.cat(box_list, dim=1)        # [B, 2, 4*reg_max, H, W]
+            cls_stack = torch.cat(cls_list, dim=1)        # [B, 2, nc, H, W]
+
+            # top-2 weights만 추출 후 renorm
+            w_top = weights[:, top_idx]                   # [B, 2]
+            w_top = w_top / (w_top.sum(dim=1, keepdim=True) + 1e-12)  # renorm
+            w = w_top.view(B, topk, 1, 1, 1)
+
+            box_mixed = (box_stack * w).sum(dim=1)
+            cls_mixed = (cls_stack * w).sum(dim=1)
+
+            out_i = torch.cat([box_mixed, cls_mixed], dim=1)  # [B, no, H, W]
+            outputs.append(out_i)
+
+            # 4) usage 통계 (gradient 필요 X → no_grad)
+            if self.training:
+                with torch.no_grad():
+                    # batch 합을 count에 누적
+                    self.expert_counts[i] += weights.sum(dim=0)
+
+        if self.training:
+            # load-balance auxiliary loss를 전역 컨텍스트에 저장
+            aux_loss = self._compute_load_balance_loss(router_info)
+            MOE_CONTEXT["aux_loss"] = aux_loss
+            # train 모드에서는 Detect와 마찬가지로 raw outputs만 넘김
+
+            self._last_router_info = [
+            (w.detach().clone(), l.detach().clone()) for (w, l) in router_info
+            ]
+
+            return outputs
+
+        # eval / export 시에는 Detect의 inference 경로 재사용
+        det = self._inference(outputs)
+        return det if self.export else (det, x)
+
+    @torch.no_grad()
+    def init_from_detect(self, detect_head: Detect, noise_scale: float) -> None:
+        assert isinstance(detect_head, Detect)
+        assert detect_head.nl == self.nl
+
+        print(f"[MoE init] noise_scale={float(noise_scale):.5f}")
+
+        copy_cls = (detect_head.nc == self.nc)
+        if not copy_cls:
+            print(f"[MoE init] WARNING: detect_head.nc={detect_head.nc}, moe.nc={self.nc} → cls 랜덤 유지")
+
+        for i in range(self.nl):
+            base_reg = detect_head.cv2[i]
+            base_cls = detect_head.cv3[i]
+
+            # ---- 1) expert0에만 base weight 로드 ----
+            ex0 = self.experts[i][0]
+            ex0.cv2.load_state_dict(base_reg.state_dict())
+
+            if copy_cls:
+                ex_cv3_sd = ex0.cv3.state_dict()
+                base_cv3_sd = base_cls.state_dict()
+                merged = {k: v for k, v in base_cv3_sd.items()
+                        if k in ex_cv3_sd and ex_cv3_sd[k].shape == v.shape}
+                ex0.cv3.load_state_dict({**ex_cv3_sd, **merged})
+
+            # ---- 2) 나머지 expert는 expert0 복제 후 노이즈 ----
+            for e in range(1, self.num_experts):
+                ex = self.experts[i][e]
+                ex.load_state_dict(ex0.state_dict(), strict=True)
+
+                if noise_scale > 0:
+                    for m in ex.modules():
+                        # conv만 perturb (BN/others skip)
+                        if isinstance(m, torch.nn.Conv2d):
+                            m.weight.add_(noise_scale * torch.randn_like(m.weight))
+                            if m.bias is not None:
+                                m.bias.add_(noise_scale * torch.randn_like(m.bias))
+
+    def _compute_load_balance_loss(
+        self,
+        router_info: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """
+        router_info: 각 scale마다 (routing_weights[B,E], routing_logits[B,E]) 튜플 리스트.
+
+        - entropy: per-sample routing 분포가 너무 one-hot 되지 않게 유도
+        - balance: 전체 batch 기준 expert 사용량이 고르게 되도록 유도
+        """
+        if not router_info:
+            return next(self.parameters()).new_tensor(0.0)
+
+        total_entropy = 0.0
+        total_balance = 0.0
+        num_scales = len(router_info)
+
+        for weights, _ in router_info:  # weights: [B, E]
+            B, E = weights.shape
+
+            # 1) per-sample entropy
+            p = weights.clamp_min(1e-8)
+            entropy = -(p * p.log()).sum(dim=1).mean()  # scalar
+            total_entropy = total_entropy + entropy
+
+            # 2) global usage balance
+            mean_usage = weights.mean(dim=0)                     # [E]
+            mean_usage = mean_usage / mean_usage.sum().clamp_min(1e-8)
+            uniform = mean_usage.new_full((E,), 1.0 / E)
+            balance = ((mean_usage - uniform) ** 2).mean()
+            total_balance = total_balance + balance
+
+        lambda_entropy = getattr(self, "lambda_entropy", 0.05)
+        lambda_balance = getattr(self, "lambda_balance", 1.0)
+        # print("[DBG] lambda_entropy/balance used:", lambda_entropy, lambda_balance)
+
+        aux_loss = (
+            lambda_balance * total_balance
+            - lambda_entropy * total_entropy
+        ) / num_scales
+        # print(f"[DBG]aux_loss {aux_loss} = (lambda_balance {lambda_balance} * total_balance {total_balance} - lambda_entropy {lambda_entropy} * total_entropy {total_entropy}) / num_scales {num_scales}")
+
+        return aux_loss
+
+    def apply_moe_schedule(self, epoch: int, max_epoch: int,
+                       base_T: float,
+                       base_entropy: float,
+                       base_balance: float,
+                       base_noise: float,
+                       warmup_ratio: float = 0.3,
+                       mid_ratio: float = 0.6):
+        assert max_epoch and max_epoch > 0
+        epoch_progress = epoch / max_epoch
+
+        if epoch_progress < warmup_ratio:
+            pass
+        elif epoch_progress < mid_ratio:
+            pass
+        else:
+            pass
